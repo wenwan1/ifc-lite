@@ -51,6 +51,7 @@ export function ViewportContainer() {
   const cesiumEnabled = useViewerStore((s) => s.cesiumEnabled);
   const cesiumPlacementDraft = useViewerStore((s) => s.cesiumPlacementDraft);
   const cesiumPlacementDraftModelId = useViewerStore((s) => s.cesiumPlacementDraftModelId);
+  const anchorModelIdOverride = useViewerStore((s) => s.anchorModelIdOverride);
   const georefMutations = useViewerStore((s) => s.georefMutations);
   const setCesiumSourceModelId = useViewerStore((s) => s.setCesiumSourceModelId);
   const setCesiumAvailable = useViewerStore((s) => s.setCesiumAvailable);
@@ -75,8 +76,10 @@ export function ViewportContainer() {
     models,
     boundedGeometryMode,
     geometryUpdateTick,
+    geometryContentVersion,
   } = viewportStoreState;
   const storeModels = models;
+  const mergedContentVersionRef = useRef(geometryContentVersion);
 
   // Check if we have models loaded (for determining add vs replace behavior)
   const hasModelsLoaded = models.size > 0 || (geometryResult?.meshes && geometryResult.meshes.length > 0);
@@ -118,6 +121,15 @@ export function ViewportContainer() {
 
       if (mergedLengthsRef.current.size !== storeModels.size) {
         shouldRebuild = true;
+      }
+
+      // An external content version bump (e.g. realignFederation re-baked
+      // vertices in place) requires a full cache rebuild — length/visibility
+      // triggers above can't detect in-place mutation. Compare against the
+      // last version we honoured; rebuild when it bumps.
+      if (mergedContentVersionRef.current !== geometryContentVersion) {
+        shouldRebuild = true;
+        mergedContentVersionRef.current = geometryContentVersion;
       }
 
       for (const [modelId, model] of storeModels) {
@@ -180,7 +192,7 @@ export function ViewportContainer() {
 
     // Legacy mode (no federation): use original geometryResult
     return geometryResult;
-  }, [storeModels, geometryResult, modelIdToIndex]);
+  }, [storeModels, geometryResult, modelIdToIndex, geometryContentVersion]);
 
   /**
    * Aggregate point clouds across visible models.
@@ -232,8 +244,18 @@ export function ViewportContainer() {
       };
     };
 
-    // Check federated models first
-    for (const [modelId, model] of storeModels) {
+    // Check federated models, preferring the user-pinned anchor when present.
+    // Matches findReferenceGeorefModel() in useIfcFederation so the Cesium bridge
+    // and the parse-time alignment agree on which model drives the world frame.
+    const orderedModels = (() => {
+      if (!anchorModelIdOverride) return Array.from(storeModels);
+      const entries = Array.from(storeModels);
+      const anchorIdx = entries.findIndex(([id]) => id === anchorModelIdOverride);
+      if (anchorIdx <= 0) return entries;
+      const reordered = [entries[anchorIdx], ...entries.slice(0, anchorIdx), ...entries.slice(anchorIdx + 1)];
+      return reordered;
+    })();
+    for (const [modelId, model] of orderedModels) {
       const ds = model.ifcDataStore;
       if (!ds) continue;
       const effective = getEffectiveGeoreference(
@@ -286,6 +308,7 @@ export function ViewportContainer() {
     mergedGeometryResult,
     cesiumPlacementDraft,
     cesiumPlacementDraftModelId,
+    anchorModelIdOverride,
   ]);
 
   // Determine whether Cesium button should be visible (model has georef or user added it via mutations).
@@ -1007,6 +1030,7 @@ export function ViewportContainer() {
       <Viewport
         geometry={filteredGeometry}
         geometryVersion={geometryVersion}
+        geometryContentVersion={geometryContentVersion}
         pointClouds={mergedPointClouds}
         coordinateInfo={mergedGeometryResult?.coordinateInfo}
         computedIsolatedIds={computedIsolatedIds}

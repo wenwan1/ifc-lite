@@ -58,6 +58,7 @@
     "benchmark:check": "node scripts/check-benchmark-regression.js",
     "benchmark:baseline": "pnpm --filter viewer build && pnpm test:benchmark:viewer",
     "generate:bim-globals": "tsx scripts/generate-bim-globals.ts",
+    "verify:epsg": "pnpm --filter @ifc-lite/data verify:epsg",
     "generate:epsg-index": "tsx scripts/generate-epsg-index.ts",
     "check:templates": "pnpm --filter viewer check:templates"
   },
