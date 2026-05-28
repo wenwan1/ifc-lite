@@ -42,6 +42,14 @@ pub(crate) fn build_geometry_style_index(
 pub(crate) struct GeometryStyleIndexes {
     pub colors: rustc_hash::FxHashMap<u32, [f32; 4]>,
     pub shading_colors: rustc_hash::FxHashMap<u32, [f32; 4]>,
+    /// Geometry IDs that had an `IfcStyledItem` directly authored on
+    /// them. Distinct from `colors` because the merge below also folds
+    /// in `IfcIndexedColourMap` dominant colours for geometries without
+    /// a styled item — once merged, the source is no longer
+    /// recoverable. PR #867 review (chatgpt-codex P2): the per-
+    /// triangle colour-map splitter in `gpu_meshes.rs` must defer to
+    /// IfcStyledItem when both are authored on the same face set.
+    pub styled_item_geoms: rustc_hash::FxHashSet<u32>,
 }
 
 /// Single-pass variant that also returns the per-geometry shading colour
@@ -55,6 +63,7 @@ pub(crate) fn build_geometry_style_indexes(
 
     let mut style_index: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
     let mut shading_index: FxHashMap<u32, [f32; 4]> = FxHashMap::default();
+    let mut styled_item_geoms: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
     // Stash IfcIndexedColourMap results separately so the merge below can
     // give IfcStyledItem unconditional precedence regardless of scan order
     // — files where an IFCINDEXEDCOLOURMAP appears before its matching
@@ -87,6 +96,7 @@ pub(crate) fn build_geometry_style_indexes(
                     extract_color_pair_from_styles(styles_attr, decoder)
                 {
                     style_index.insert(geometry_id, color);
+                    styled_item_geoms.insert(geometry_id);
                     if let Some(s) = shading {
                         shading_index.insert(geometry_id, s);
                     }
@@ -114,6 +124,7 @@ pub(crate) fn build_geometry_style_indexes(
     GeometryStyleIndexes {
         colors: style_index,
         shading_colors: shading_index,
+        styled_item_geoms,
     }
 }
 
@@ -140,6 +151,93 @@ pub(crate) fn extract_color_from_indexed_colour_map_span(
     decoder: &mut ifc_lite_core::EntityDecoder,
 ) -> Option<(u32, [f32; 4])> {
     extract_color_from_indexed_colour_map(id, start, end, decoder)
+}
+
+/// Full IfcIndexedColourMap payload: every authored colour + the per-
+/// triangle index list, so callers can split a mesh into colour groups
+/// instead of collapsing to a single dominant colour.
+///
+/// Used for issue #858 — `tessellation-with-individual-colors.ifc`
+/// authors a 12-triangle cube with three colours (red/green/yellow);
+/// the dominant-only path picked red and rendered the whole cube red.
+pub(crate) struct IndexedColourMapResolved {
+    /// Target IfcTessellatedFaceSet entity id.
+    pub geometry_id: u32,
+    /// Resolved RGBA palette. 1-based indexing per ISO 10303-21 — index 1
+    /// is `colours[0]`, etc.
+    pub colours: Vec<[f32; 4]>,
+    /// Per-triangle 1-based palette index. Same length as the face-set's
+    /// triangle list.
+    pub triangle_indices: Vec<u32>,
+}
+
+/// Span-based companion to [`extract_color_from_indexed_colour_map_span`]
+/// that returns the full per-triangle colour assignment rather than
+/// collapsing to a single dominant colour. Returns `None` when the map
+/// can't be resolved (bad references, empty index list, etc.).
+pub(crate) fn extract_full_indexed_colour_map_span(
+    id: u32,
+    start: usize,
+    end: usize,
+    decoder: &mut ifc_lite_core::EntityDecoder,
+) -> Option<IndexedColourMapResolved> {
+    let entity = decoder.decode_at_with_id(id, start, end).ok()?;
+    let geometry_id = entity.get_ref(0)?;
+    let opacity = entity
+        .get(1)
+        .and_then(|a| a.as_float())
+        .map(|v| v as f32)
+        .unwrap_or(1.0)
+        .clamp(0.0, 1.0);
+    let colours_id = entity.get_ref(2)?;
+    let index_list = entity.get(3)?.as_list()?;
+    if index_list.is_empty() {
+        return None;
+    }
+
+    let colours_entity = decoder.decode_by_id(colours_id).ok()?;
+    let colour_list = colours_entity.get(0)?.as_list()?;
+    // Strict-mode resolution: any malformed entry collapses the whole
+    // map to `None` so the caller falls back to the dominant-colour
+    // path. PR #867 review (CodeRabbit Major) — `filter_map` previously
+    // silently dropped bad rows / negative indices, leaving the
+    // resolver returning a palette/index mapping that no longer
+    // matched the authored triangle count. The splitter would then
+    // emit fewer triangles than the source mesh instead of routing
+    // through the single-colour fallback. Reject the whole map up
+    // front so the contract `triangle_indices.len() == mesh.tris`
+    // holds whenever the resolver returns Some.
+    let mut colours: Vec<[f32; 4]> = Vec::with_capacity(colour_list.len());
+    for c in colour_list {
+        let rgb = c.as_list()?;
+        let r = rgb.first().and_then(|v| v.as_float())? as f32;
+        let g = rgb.get(1).and_then(|v| v.as_float())? as f32;
+        let b = rgb.get(2).and_then(|v| v.as_float())? as f32;
+        colours.push([r, g, b, opacity]);
+    }
+    if colours.is_empty() {
+        return None;
+    }
+
+    let mut triangle_indices: Vec<u32> = Vec::with_capacity(index_list.len());
+    for v in index_list {
+        let idx = v.as_int()?;
+        if idx <= 0 || (idx as usize) > colours.len() {
+            // Out-of-range / non-positive index ⇒ the entire map is
+            // structurally invalid; bail.
+            return None;
+        }
+        triangle_indices.push(idx as u32);
+    }
+    if triangle_indices.is_empty() {
+        return None;
+    }
+
+    Some(IndexedColourMapResolved {
+        geometry_id,
+        colours,
+        triangle_indices,
+    })
 }
 
 fn extract_color_from_indexed_colour_map(
@@ -586,6 +684,18 @@ pub(crate) struct PrePassData {
     /// `propagate_voids_to_parts` so the merge-layers toggle (#540) can skip
     /// per-part meshes when the parent is sliceable.
     pub part_to_parent: rustc_hash::FxHashMap<u32, u32>,
+    /// Geometry IDs that had an `IfcStyledItem` directly authored. Used by
+    /// the per-triangle IfcIndexedColourMap splitter to defer to the
+    /// styled-item colour when both mechanisms are authored on the same
+    /// face set. PR #867 review (chatgpt-codex P2).
+    pub styled_item_geoms: rustc_hash::FxHashSet<u32>,
+    /// Full per-face IfcIndexedColourMap payload keyed by face-set geometry
+    /// id. Populated only when the streaming / async render loop needs to
+    /// split a flat-shaded mesh into per-colour sub-meshes (issue #858).
+    /// `None` entry means "no colour map" (cheaper than an absent key for
+    /// the hot lookup); the splitter only fires when this map's
+    /// `triangle_indices` length matches the source mesh's triangle count.
+    pub indexed_colour_maps: rustc_hash::FxHashMap<u32, IndexedColourMapResolved>,
 }
 
 /// Single EntityScanner pass that collects everything needed before geometry
@@ -625,6 +735,11 @@ pub(crate) fn combined_pre_pass(
     let mut material_def_reprs: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     // IfcRelAssociatesMaterial: element_id → material_select_id
     let mut element_to_material: FxHashMap<u32, u32> = FxHashMap::default();
+    // PR #867: geometries with a direct IfcStyledItem (so the per-face
+    // colour-map splitter can defer to the styled colour), and the full
+    // per-face colour-map payload for the splitter itself.
+    let mut styled_item_geoms: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+    let mut indexed_colour_maps: FxHashMap<u32, IndexedColourMapResolved> = FxHashMap::default();
 
     let mut scanner = EntityScanner::new(content);
 
@@ -640,11 +755,17 @@ pub(crate) fn combined_pre_pass(
                                     extract_color_pair_from_styles(styles_attr, decoder)
                                 {
                                     geometry_styles.insert(geometry_id, color);
+                                    styled_item_geoms.insert(geometry_id);
                                     if let Some(s) = shading {
                                         geometry_shading_styles.insert(geometry_id, s);
                                     }
                                 }
                             }
+                        } else {
+                            // Already-styled geometry — still record source so
+                            // the colour-map splitter knows to defer to the
+                            // styled colour (PR #867).
+                            styled_item_geoms.insert(geometry_id);
                         }
                     } else {
                         // Orphan IfcStyledItem (null Item) — material-based color
@@ -664,6 +785,18 @@ pub(crate) fn combined_pre_pass(
                     extract_color_from_indexed_colour_map(id, start, end, decoder)
                 {
                     colour_map_styles.entry(geometry_id).or_insert(color);
+                }
+                // ALSO collect the full per-face payload so the streaming /
+                // async render loops can split a flat-shaded mesh into per-
+                // colour sub-meshes (issue #858 / PR #867). Re-decoding is
+                // cheap (~µs) compared to the geometry pass that follows,
+                // and the dominant-colour fast path above caches the
+                // map's first decode under the hood so this is mostly
+                // a re-pull from the entity cache.
+                if let Some(resolved) =
+                    extract_full_indexed_colour_map_span(id, start, end, decoder)
+                {
+                    indexed_colour_maps.insert(resolved.geometry_id, resolved);
                 }
             }
             "IFCMATERIALDEFINITIONREPRESENTATION" | "IFCRELASSOCIATESMATERIAL" => {
@@ -777,6 +910,8 @@ pub(crate) fn combined_pre_pass(
         element_material_styles,
         material_layer_index,
         part_to_parent,
+        styled_item_geoms,
+        indexed_colour_maps,
     }
 }
 
@@ -1566,5 +1701,58 @@ END-ISO-10303-21;
         // Unrelated express ID — neither the wall nor any item in its rep.
         styles.insert(999, [0.5, 0.5, 0.5, 1.0]);
         assert_eq!(resolve_element_color(&wall, &styles, &mut decoder), None);
+    }
+}
+
+#[cfg(test)]
+mod indexed_colour_map_tests {
+    //! Issue #858 — `IfcIndexedColourMap` must surface every authored
+    //! colour, not just the dominant one. `extract_full_indexed_colour_map_span`
+    //! is the data-extraction half of the fix; `gpu_meshes.rs` consumes the
+    //! resolved struct to split a flat-shaded mesh into per-colour groups.
+    use super::extract_full_indexed_colour_map_span;
+    use ifc_lite_core::{build_entity_index, EntityDecoder, EntityScanner};
+
+    /// Minimal IFC4 fixture: an `IfcTriangulatedFaceSet` with 12 triangles
+    /// + an `IfcIndexedColourMap` assigning 3 colours
+    /// (red / green / yellow). Matches the reporter's
+    /// `tessellation-with-individual-colors.ifc` structure.
+    const FIXTURE: &str = "ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('test'),'2;1');
+FILE_NAME('','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#200=IFCCARTESIANPOINTLIST3D(((0.0,0.0,0.0),(1.0,0.0,0.0),(1.0,1.0,0.0),(0.0,1.0,0.0),(0.0,0.0,1.0),(1.0,0.0,1.0),(1.0,1.0,1.0),(0.0,1.0,1.0)));
+#201=IFCTRIANGULATEDFACESET(#200,$,.T.,((1,6,5),(1,2,6),(6,2,7),(7,2,3),(7,8,6),(6,8,5),(5,8,1),(1,8,4),(4,2,1),(2,4,3),(4,8,7),(7,3,4)),$);
+#202=IFCCOLOURRGBLIST(((1.0,0.0,0.0),(0.0,0.5,0.0),(1.0,1.0,0.0)));
+#203=IFCINDEXEDCOLOURMAP(#201,$,#202,(1,1,2,2,3,3,1,1,1,1,1,1));
+ENDSEC;
+END-ISO-10303-21;
+";
+
+    #[test]
+    fn extracts_three_colours_with_twelve_indices() {
+        let mut decoder = EntityDecoder::with_index(FIXTURE, build_entity_index(FIXTURE));
+        let mut scanner = EntityScanner::new(FIXTURE);
+        let mut resolved = None;
+        while let Some((id, name, start, end)) = scanner.next_entity() {
+            if name == "IFCINDEXEDCOLOURMAP" {
+                resolved = extract_full_indexed_colour_map_span(id, start, end, &mut decoder);
+                break;
+            }
+        }
+        let r = resolved.expect("colour map must resolve");
+        assert_eq!(r.geometry_id, 201);
+        assert_eq!(r.colours.len(), 3, "all three palette entries must surface");
+        assert_eq!(r.colours[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(r.colours[1], [0.0, 0.5, 0.0, 1.0]);
+        assert_eq!(r.colours[2], [1.0, 1.0, 0.0, 1.0]);
+        assert_eq!(
+            r.triangle_indices,
+            vec![1, 1, 2, 2, 3, 3, 1, 1, 1, 1, 1, 1],
+            "per-triangle palette assignment must round-trip verbatim",
+        );
     }
 }
