@@ -3,19 +3,19 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /**
- * Always-on extraction of IfcAlignment centerlines for the 3D viewport.
+ * Extraction of IfcGrid / IfcGridAxis centerlines for the 3D viewport
+ * (issue #967, follow-up to #945/#966).
  *
- * IfcAlignment carries its geometry in the `Axis` curve (an IfcAlignmentCurve
- * or IfcPolyline), not a `Representation`, so it never produces a mesh in the
- * streaming batch mesher. Instead of rendering it as a triangulated ribbon —
- * which reads as a thin solid strip — the WASM `parseAlignmentLines` API
- * samples the directrix into a flat 3D line-list in renderer Y-up world space,
- * which we feed to `renderer.uploadAlignmentLines3D`. This matches how IfcGrid
- * axes and IfcAnnotation curves render as thin lines.
+ * IfcGrid carries its axes as IfcGridAxis curves (not a `Representation`), so
+ * they never produce a mesh in the streaming batch mesher. The WASM
+ * `parseGridLines` API resolves every axis through the same placement +
+ * unit-scale + RTC pipeline as the meshes and returns a flat 3D line-list in
+ * renderer Y-up world space, which we feed to `renderer.uploadGridLines3D`.
+ * This mirrors `useAlignmentLines3D`.
  *
- * Unlike annotations there is no visibility toggle: alignment lines render
- * whenever a loaded model has alignments. The parse runs once per model source
- * and is cached module-globally, so federated views share one parse per source.
+ * Unlike alignment (always-on), grids are gated by the `ifcGrid` type-visibility
+ * toggle — but the parse itself is unconditional and cached; the Viewport only
+ * uploads/clears based on the toggle.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -39,13 +39,13 @@ function notifyCacheChange(): void {
   for (const fn of CACHE_LISTENERS) fn();
 }
 
-async function parseAlignmentLinesFor(store: IfcDataStore): Promise<Float32Array> {
+async function parseGridLinesFor(store: IfcDataStore): Promise<Float32Array> {
   const source = store.source;
   if (!source || source.byteLength === 0) return EMPTY_F32;
   const processor = new GeometryProcessor();
   try {
     await processor.init();
-    const verts = processor.parseAlignmentLines(source);
+    const verts = processor.parseGridLines(source);
     return verts && verts.length > 0 ? verts : EMPTY_F32;
   } finally {
     processor.dispose();
@@ -61,13 +61,13 @@ function ensureParseFor(stores: IfcDataStore[]): void {
 
     const promise = (async () => {
       try {
-        const verts = await parseAlignmentLinesFor(store);
+        const verts = await parseGridLinesFor(store);
         PARSE_CACHE.set(key, verts);
         notifyCacheChange();
       } catch (error) {
         // Cache empty on failure so we don't retry a doomed parse every tick.
         // eslint-disable-next-line no-console
-        console.warn('[useAlignmentLines3D] parse failed:', error);
+        console.warn('[useGridLines3D] parse failed:', error);
         PARSE_CACHE.set(key, EMPTY_F32);
         notifyCacheChange();
       } finally {
@@ -95,12 +95,13 @@ function useActiveStores(): IfcDataStore[] {
 }
 
 /**
- * Sample every loaded model's IfcAlignment centerlines into a single flat
+ * Sample every loaded model's IfcGridAxis lines into a single flat
  * `[x0,y0,z0, x1,y1,z1, …]` line-list in renderer world space (Y-up,
- * RTC-subtracted, metres). Returns a stable empty array when no model carries
- * an alignment. Always parses (no toggle) — see the file header.
+ * RTC-subtracted, metres). Returns a stable empty array when no model carries a
+ * grid. Parsing is unconditional + cached; the Viewport gates rendering on the
+ * `ifcGrid` type-visibility toggle.
  */
-export function useAlignmentLines3D(): Float32Array {
+export function useGridLines3D(): Float32Array {
   const stores = useActiveStores();
   const [version, setVersion] = useState(0);
 
