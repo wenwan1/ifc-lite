@@ -30,6 +30,12 @@ export interface VisibilitySlice {
   /** 3D view mode for the Model/Types switch (#957 follow-up). 'model' shows
    *  placed occurrences (default); 'types' shows the type-library shapes. */
   typeViewMode: TypeViewMode;
+  /** True when the rendered geometry contains any type-library geometry
+   *  (geometryClass 1 = orphan type, 2 = instanced type) — i.e. the Model/Types
+   *  switch has something to reveal in "Types" mode. Derived from the merged
+   *  mesh set by ViewportContainer; most models carry only occurrence geometry
+   *  (class 0), so the switch stays hidden for them. */
+  hasTypeGeometry: boolean;
 
   // State (multi-model)
   /** Hidden entities per model */
@@ -58,6 +64,10 @@ export interface VisibilitySlice {
   resetTypeVisibility: () => void;
   /** Set the Model/Types 3D view mode (and persist). */
   setTypeViewMode: (mode: TypeViewMode) => void;
+  /** Set whether the current geometry contains type-library geometry — drives
+   *  whether the Model/Types switch renders at all. Runtime-only (not persisted);
+   *  re-derived from geometry on every load. */
+  setHasTypeGeometry: (value: boolean) => void;
   /** Set all hidden entities at once (for BCF viewpoint application) */
   setHiddenEntities: (ids: Set<number>) => void;
   /** Set all isolated entities at once (for BCF viewpoint with defaultVisibility=false) */
@@ -92,6 +102,8 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
   // Read persisted toggles fresh so the user's choices survive reloads.
   typeVisibility: getPersistedTypeVisibility(),
   typeViewMode: getPersistedTypeViewMode(),
+  // Derived from geometry at load time — no model is open yet, so default false.
+  hasTypeGeometry: false,
 
   // Initial state (multi-model)
   hiddenEntitiesByModel: new Map(),
@@ -241,6 +253,14 @@ export const createVisibilitySlice: StateCreator<VisibilitySlice, [], [], Visibi
     }
     return { typeViewMode: mode };
   }),
+
+  setHasTypeGeometry: (value) => set((state) => (
+    // Return the SAME state reference when unchanged — a fresh `{}` would still
+    // merge into a new state object and notify every subscriber (incl. the
+    // whole-state useSyncExternalStore in ViewportContainer). Same ref → Zustand
+    // skips the notification entirely.
+    state.hasTypeGeometry === value ? state : { hasTypeGeometry: value }
+  )),
 
   // Actions (multi-model)
   hideEntityInModel: (modelId, expressId) => set((state) => {
