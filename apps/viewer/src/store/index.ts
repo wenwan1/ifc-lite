@@ -330,6 +330,7 @@ const createViewerStore = () => create<ViewerState>()((...args) => ({
         scale: 100,
         useSymbolicRepresentations: false,
         showIfcAnnotations: true,
+        showConstructionProjection: false,
       },
       // Graphic overrides (keep presets, reset active and custom)
       activePresetId: 'preset-3d-colors',

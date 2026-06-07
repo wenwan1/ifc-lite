@@ -21,9 +21,33 @@ import {
   type Drawing2D,
   type DrawingLine,
   type SectionConfig,
+  type ProfileEntry,
+  type MeshOutline2D,
 } from '@ifc-lite/drawing-2d';
 import { GeometryProcessor, type GeometryResult } from '@ifc-lite/geometry';
+import * as IfcWasm from '@ifc-lite/wasm';
 import { customPlaneCenter } from '@/store';
+
+// The winding-robust Rust `meshOutline2d` binding (issue #979) is gitignored →
+// CI-built, so reference it defensively: against an older wasm bundle it's
+// undefined and projection falls back to the TS mesh silhouette. The wasm
+// module is already initialised (the model loaded through it), so the free
+// function can be called without a GeometryProcessor instance.
+interface MeshOutlineHandle {
+  readonly axisMin: number;
+  readonly axisMax: number;
+  readonly contourCount: number;
+  contour(index: number): Float32Array | undefined;
+  free(): void;
+}
+type MeshOutline2dFn = (
+  positions: Float32Array,
+  indices: Uint32Array,
+  axis: number,
+  flipped: boolean,
+) => MeshOutlineHandle | undefined;
+const meshOutline2dFn = (IfcWasm as unknown as { meshOutline2d?: MeshOutline2dFn }).meshOutline2d;
+const AXIS_CODE: Record<'x' | 'y' | 'z', number> = { x: 0, y: 1, z: 2 };
 
 // Axis conversion from semantic (down/front/side) to geometric (x/y/z)
 export const AXIS_MAP: Record<'down' | 'front' | 'side', 'x' | 'y' | 'z'> = {
@@ -61,7 +85,7 @@ interface UseDrawingGenerationParams {
       bitangent: [number, number, number];
     };
   };
-  displayOptions: { showHiddenLines: boolean; useSymbolicRepresentations: boolean; show3DOverlay: boolean; scale: number };
+  displayOptions: { showHiddenLines: boolean; useSymbolicRepresentations: boolean; show3DOverlay: boolean; scale: number; showConstructionProjection: boolean };
   combinedHiddenIds: Set<number>;
   combinedIsolatedIds: Set<number> | null;
   computedIsolatedIds?: Set<number> | null;
@@ -127,6 +151,17 @@ export function useDrawingGeneration({
     useSymbolic: boolean;
   } | null>(null);
 
+  // Cache for extracted extruded-solid profiles (issue #979 construction
+  // projection). Like symbolic reps these are section-position-independent, so
+  // they're parsed once per model and reused across section moves. Every typed
+  // array is copied off the WASM heap (`.slice()`) and the WASM handles freed
+  // deterministically before caching — caching a live view would dangle once
+  // the shared dlmalloc heap grows/reuses (AGENTS.md §7).
+  const profileCacheRef = useRef<{
+    profiles: ProfileEntry[];
+    sourceId: string | null;
+  } | null>(null);
+
   // Generate drawing when panel opens
   const generateDrawing = useCallback(async (isRegenerate = false) => {
     if (!geometryResult?.meshes || geometryResult.meshes.length === 0) {
@@ -152,7 +187,7 @@ export function useDrawingGeneration({
     // For multi-model: create cache key from model count and visible model IDs
     // For single-model: use source byteLength as before
     const modelCacheKey = models.size > 0
-      ? `${models.size}-${[...models.values()].filter(m => m.visible).map(m => m.id).sort().join(',')}`
+      ? `${models.size}-${[...models.values()].filter(m => m.visible).map(m => m.id).sort().join('|')}`
       : (ifcDataStore?.source ? String(ifcDataStore.source.byteLength) : null);
 
     const useSymbolic = displayOptions.useSymbolicRepresentations && !!ifcDataStore?.source;
@@ -341,6 +376,96 @@ export function useDrawingGeneration({
       }
     }
 
+    // Construction projection is plan-only (issue #979): the cut must be the
+    // cardinal 'down' axis and not a face-picked custom plane. The UI disables
+    // the toggle off-plan, but the persisted flag can stay true when the user
+    // switches axis — so gate generation here too, otherwise front/side/custom
+    // sections keep emitting projection the user can't turn off.
+    const projectionSupported = sectionPlane.axis === 'down' && !sectionPlane.custom;
+    const projectionOn = projectionSupported && displayOptions.showConstructionProjection;
+
+    // ── Construction projection profiles (issue #979) ────────────────────────
+    // Extract extruded-area-solid profiles for the clean projection path. Only
+    // when projection is on; cached per model since they don't move with the
+    // section. Single-model (modelIndex 0) for now, mirroring the symbolic
+    // path's federation limitation.
+    let profiles: ProfileEntry[] = [];
+    if (projectionOn && ifcDataStore?.source) {
+      const pcache = profileCacheRef.current;
+      if (pcache && pcache.sourceId === modelCacheKey) {
+        profiles = pcache.profiles;
+      } else {
+        if (!isRegenerate) {
+          setDrawingProgress(10, 'Extracting profiles...');
+        }
+        try {
+          const processor = new GeometryProcessor();
+          try {
+            await processor.init();
+            // ProfileCollection + each ProfileEntryJs are WASM-bindgen handles
+            // owning WASM memory. Copy every typed array off the heap with
+            // `.slice()` and free each handle deterministically before caching
+            // (AGENTS.md §7 — leaking to GC corrupts the shared dlmalloc heap).
+            const collection = processor.extractProfiles(ifcDataStore.source, 0);
+            if (collection) {
+              try {
+                // Profiles come back in UNSHIFTED WebGL world space, but the
+                // meshes and the section position live in the render frame
+                // (issue #945 RTC / large-coordinate shift). Subtract the same
+                // shift so projection lines land on the cut geometry for
+                // georeferenced models — a no-op for small-coordinate models
+                // (AC20). The WASM mesh path subtracts the RTC offset in IFC
+                // Z-up then converts to Y-up via (x,y,z)→(x,z,−y), so the Y-up
+                // shift is (rtc.x, rtc.z, −rtc.y); the TS path instead
+                // subtracts `originShift`, already in Y-up.
+                const ci = geometryResult.coordinateInfo;
+                const rtc = ci.wasmRtcOffset;
+                const shift = rtc
+                  ? { x: rtc.x, y: rtc.z, z: -rtc.y }
+                  : ci.originShift;
+                const len = collection.length;
+                for (let i = 0; i < len; i++) {
+                  const entry = collection.get(i);
+                  if (!entry) continue;
+                  try {
+                    const transform = entry.transform.slice();
+                    transform[12] -= shift.x;
+                    transform[13] -= shift.y;
+                    transform[14] -= shift.z;
+                    profiles.push({
+                      expressId: entry.expressId,
+                      ifcType: entry.ifcType,
+                      outerPoints: entry.outerPoints.slice(),
+                      holeCounts: entry.holeCounts.slice(),
+                      holePoints: entry.holePoints.slice(),
+                      transform,
+                      extrusionDir: entry.extrusionDir.slice(),
+                      extrusionDepth: entry.extrusionDepth,
+                      modelIndex: 0,
+                    });
+                  } finally {
+                    entry.free();
+                  }
+                }
+              } finally {
+                collection.free();
+              }
+            }
+            profileCacheRef.current = { profiles, sourceId: modelCacheKey };
+          } finally {
+            processor.dispose();
+          }
+        } catch (error) {
+          // Degrade gracefully: the drawing still renders without projection.
+          console.warn('Profile extraction failed:', error);
+          profiles = [];
+        }
+      }
+    } else if (profileCacheRef.current) {
+      // Toggle off: drop the cache so a re-enable re-extracts cleanly.
+      profileCacheRef.current = null;
+    }
+
     let generator: Drawing2DGenerator | null = null;
     try {
       generator = new Drawing2DGenerator();
@@ -359,6 +484,17 @@ export function useDrawingGeneration({
       // Calculate max depth as half the model extent
       const maxDepth = (axisMax - axisMin) * 0.5;
 
+      // Construction-projection bands (issue #979). Project the full model
+      // extent on each side of the cut and let the band classifier split by
+      // side (below → solid, above → dashed). Full extent makes single-storey
+      // models with an overhead roof (e.g. AC20) "just work"; multi-storey
+      // bleed is naturally scoped when the user isolates a storey (the meshes
+      // are already filtered to it below). Flip-invariant: the classifier
+      // applies the flip sign itself. Floor at 1mm so a degenerate zero-extent
+      // model (or a storey collapsed to a single slab) doesn't yield 0-width
+      // bands that cull every element sitting on the plane.
+      const fullExtent = Math.max(axisMax - axisMin, 1e-3);
+
       // Adjust progress to account for symbolic parsing phase (0-20%)
       const progressOffset = symbolicLines.length > 0 ? 20 : 0;
       const progressScale = symbolicLines.length > 0 ? 0.8 : 1;
@@ -369,6 +505,8 @@ export function useDrawingGeneration({
       // Create section config
       const config: SectionConfig = createSectionConfig(axis, position, {
         projectionDepth: maxDepth,
+        projectionBelowDepth: fullExtent,
+        projectionAboveDepth: fullExtent,
         includeHiddenLines: displayOptions.showHiddenLines,
         scale: displayOptions.scale,
       });
@@ -434,13 +572,76 @@ export function useDrawingGeneration({
         return;
       }
 
-      const result = await generator.generate(meshesToProcess, config, {
-        includeHiddenLines: false,  // Disable - causes internal mesh edges
-        includeProjection: false,   // Disable - causes triangulation lines
-        includeEdges: false,        // Disable - causes triangulation lines
-        mergeLines: true,
-        onProgress: progressCallback,
-      });
+      // Construction projection (issue #979): when enabled, project geometry
+      // beyond the cut. The clean profile path handles extruded solids; the
+      // silhouette path (includeEdges) covers non-extruded geometry — roofs,
+      // stairs, site — that has no profile. The below/above band split drives
+      // solid vs dashed; hidden-line removal (below `includeHiddenLines`) is an
+      // additional occlusion pass the user controls via "show hidden lines".
+
+      // Apply the SAME hiding/isolation filters to the profiles as to the
+      // meshes, so projection respects 3D hiding and storey isolation —
+      // otherwise other storeys' profiles project through the plan and the
+      // dedup keys (built from profiles) would suppress silhouettes for
+      // entities that aren't actually drawn.
+      let projectionProfiles = profiles;
+      if (projectionOn && profiles.length > 0) {
+        if (combinedHiddenIds.size > 0) {
+          projectionProfiles = projectionProfiles.filter((p) => !combinedHiddenIds.has(p.expressId));
+        }
+        if (combinedIsolatedIds !== null) {
+          projectionProfiles = projectionProfiles.filter((p) => combinedIsolatedIds.has(p.expressId));
+        }
+        if (computedIsolatedIds !== null && computedIsolatedIds !== undefined && computedIsolatedIds.size > 0) {
+          const isolatedSet = computedIsolatedIds;
+          projectionProfiles = projectionProfiles.filter((p) => isolatedSet.has(p.expressId));
+        }
+      }
+
+      // Winding-robust outline provider for non-extruded geometry (roofs,
+      // stairs, site). Calls the Rust meshOutline2d binding per mesh; each call
+      // copies the contour data off the WASM heap and frees the handle inline.
+      // Undefined when projection is off or the binding isn't in this wasm
+      // build → the generator falls back to the TS mesh silhouette.
+      const outlineProvider =
+        projectionOn && typeof meshOutline2dFn === 'function'
+          ? (mesh: { positions: Float32Array; indices: Uint32Array }, axis: 'x' | 'y' | 'z', flipped: boolean): MeshOutline2D | null => {
+              try {
+                const handle = meshOutline2dFn(mesh.positions, mesh.indices, AXIS_CODE[axis], flipped);
+                if (!handle) return null;
+                try {
+                  const contours: Float32Array[] = [];
+                  for (let i = 0; i < handle.contourCount; i++) {
+                    const ring = handle.contour(i);
+                    if (ring) contours.push(ring.slice()); // copy off the WASM heap
+                  }
+                  if (contours.length === 0) return null;
+                  return { contours, axisMin: handle.axisMin, axisMax: handle.axisMax };
+                } finally {
+                  handle.free();
+                }
+              } catch {
+                return null; // binding unavailable/failed → silhouette fallback
+              }
+            }
+          : undefined;
+
+      const result = await generator.generate(
+        meshesToProcess,
+        config,
+        {
+          // Respect the "show hidden lines" toggle: occlusion can downgrade
+          // visible (below-cut) projection lines to dashed. Overhead lines stay
+          // dashed regardless (the generator passes them through unchanged).
+          includeHiddenLines: projectionOn ? displayOptions.showHiddenLines : false,
+          includeProjection: projectionOn,
+          includeEdges: projectionOn,
+          mergeLines: true,
+          outlineProvider,
+          onProgress: progressCallback,
+        },
+        projectionOn ? projectionProfiles : undefined,
+      );
 
       // If we have symbolic representations, create a hybrid drawing
       if (symbolicLines.length > 0 && entitiesWithSymbols.size > 0) {
@@ -502,10 +703,7 @@ export function useDrawingGeneration({
         // The kept window is `−ANNOTATION_VIEW_DEPTH ≤ signedDist ≤ 0` on
         // the −normal side — the side BELOW a down-looking camera, where
         // IFC dimensions live (authored at the storey's floor elevation,
-        // not at the cut height). This DIVERGES from
-        // `EdgeExtractor.filterEdgesByDepth`, which projects above the
-        // cut: annotations and projection edges are naturally on opposite
-        // sides of the cut plane. Flipped sections look at the same world
+        // not at the cut height). Flipped sections look at the same world
         // from the opposite side, so the slab mirrors to
         // `0 ≤ signedDist ≤ ANNOTATION_VIEW_DEPTH`.
         //
