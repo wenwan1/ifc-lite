@@ -18,6 +18,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Drawing2DGenerator,
   createSectionConfig,
+  currentFloorBands,
+  storeyFloorsFromMeshes,
   type Drawing2D,
   type DrawingLine,
   type SectionConfig,
@@ -25,6 +27,7 @@ import {
   type MeshOutline2D,
 } from '@ifc-lite/drawing-2d';
 import { GeometryProcessor, type GeometryResult } from '@ifc-lite/geometry';
+import type { SpatialHierarchy } from '@ifc-lite/data';
 import * as IfcWasm from '@ifc-lite/wasm';
 import { customPlaneCenter } from '@/store';
 
@@ -64,9 +67,22 @@ export const AXIS_MAP: Record<'down' | 'front' | 'side', 'x' | 'y' | 'z'> = {
 // live in is already in metres (WASM applies `unit_scale` upstream).
 export const ANNOTATION_VIEW_DEPTH = 1.2;
 
+// View depth BEHIND a vertical (front/side) section cut within which
+// construction projection is drawn, as a fraction of the model extent along the
+// cut axis (issue #979 follow-up). A vertical section has no "storey" to scope
+// to, so it projects a bounded slab behind the cut — near geometry solid,
+// occluded/far dashed (hidden-line pass) — and culls the cut-away front half
+// and anything past this depth. Half the model depth is a sensible default;
+// tune here if sections feel too deep or too shallow.
+export const SECTION_VIEW_DEPTH_FRACTION = 0.5;
+
 interface UseDrawingGenerationParams {
   geometryResult: GeometryResult | null | undefined;
-  ifcDataStore: { source: Uint8Array } | null;
+  // `spatialHierarchy` (optional — absent on cache-reopened models) backs the
+  // current-floor projection scoping (issue #979 follow-up). The runtime
+  // already passes the full DataStore from `useIfc()`, so this is a pure type
+  // widen, not new prop threading.
+  ifcDataStore: { source: Uint8Array; spatialHierarchy?: SpatialHierarchy } | null;
   /**
    * Section plane state. `custom` is the optional face-pick override
    * (issue #243); when set the cutter cuts on that arbitrary plane and
@@ -159,6 +175,15 @@ export function useDrawingGeneration({
   // the shared dlmalloc heap grows/reuses (AGENTS.md §7).
   const profileCacheRef = useRef<{
     profiles: ProfileEntry[];
+    sourceId: string | null;
+  } | null>(null);
+
+  // Cache for per-storey floor levels used to scope construction projection to
+  // the current floor (issue #979 follow-up). Derived from mesh-Y, so it only
+  // changes when the model/visibility set changes — keyed on the same
+  // `modelCacheKey` as the profile cache.
+  const storeyFloorsCacheRef = useRef<{
+    floors: number[];
     sourceId: string | null;
   } | null>(null);
 
@@ -376,21 +401,27 @@ export function useDrawingGeneration({
       }
     }
 
-    // Construction projection is plan-only (issue #979): the cut must be the
-    // cardinal 'down' axis and not a face-picked custom plane. The UI disables
-    // the toggle off-plan, but the persisted flag can stay true when the user
-    // switches axis — so gate generation here too, otherwise front/side/custom
-    // sections keep emitting projection the user can't turn off.
-    const projectionSupported = sectionPlane.axis === 'down' && !sectionPlane.custom;
+    // Construction projection runs on any CARDINAL cut (plan 'down' + vertical
+    // 'front'/'side'), but NOT a face-picked custom plane (the band classifier
+    // and outline binding are cardinal-only). Plan and section use different
+    // boundaries: plan scopes to the current storey; a vertical section has no
+    // "storey", so it projects a bounded view depth behind the cut (see the
+    // band computation below). The UI gates the toggle to the same set; the
+    // persisted flag can survive a switch to a custom plane, so gate here too.
+    const projectionSupported = !sectionPlane.custom;
     const projectionOn = projectionSupported && displayOptions.showConstructionProjection;
 
     // ── Construction projection profiles (issue #979) ────────────────────────
     // Extract extruded-area-solid profiles for the clean projection path. Only
-    // when projection is on; cached per model since they don't move with the
-    // section. Single-model (modelIndex 0) for now, mirroring the symbolic
-    // path's federation limitation.
+    // for PLAN cuts: the profile projector draws a solid's base footprint, which
+    // is the plan representation but collapses to a base edge on a vertical
+    // section — so front/side cuts use the mesh-silhouette/outline path instead
+    // (profiles stay empty → every mesh silhouettes). Cached per model since
+    // they don't move with the section. Single-model (modelIndex 0) for now,
+    // mirroring the symbolic path's federation limitation.
+    const profilesNeeded = projectionOn && sectionPlane.axis === 'down';
     let profiles: ProfileEntry[] = [];
-    if (projectionOn && ifcDataStore?.source) {
+    if (profilesNeeded && ifcDataStore?.source) {
       const pcache = profileCacheRef.current;
       if (pcache && pcache.sourceId === modelCacheKey) {
         profiles = pcache.profiles;
@@ -461,8 +492,10 @@ export function useDrawingGeneration({
           profiles = [];
         }
       }
-    } else if (profileCacheRef.current) {
-      // Toggle off: drop the cache so a re-enable re-extracts cleanly.
+    } else if (!projectionOn && profileCacheRef.current) {
+      // Projection fully off: drop the cache so a re-enable re-extracts cleanly.
+      // A plan↔section switch (projection still on) keeps the cache so flipping
+      // back to a plan reuses the extracted profiles.
       profileCacheRef.current = null;
     }
 
@@ -484,16 +517,78 @@ export function useDrawingGeneration({
       // Calculate max depth as half the model extent
       const maxDepth = (axisMax - axisMin) * 0.5;
 
-      // Construction-projection bands (issue #979). Project the full model
-      // extent on each side of the cut and let the band classifier split by
-      // side (below → solid, above → dashed). Full extent makes single-storey
-      // models with an overhead roof (e.g. AC20) "just work"; multi-storey
-      // bleed is naturally scoped when the user isolates a storey (the meshes
-      // are already filtered to it below). Flip-invariant: the classifier
-      // applies the flip sign itself. Floor at 1mm so a degenerate zero-extent
-      // model (or a storey collapsed to a single slab) doesn't yield 0-width
-      // bands that cull every element sitting on the plane.
+      // Construction-projection bands (issue #979 + current-floor follow-up).
+      // Project geometry on each side of the cut and let the band classifier
+      // split it (below → solid, above → dashed). `fullExtent` (the whole model
+      // height) is the baseline; for a multi-storey model on a plan cut the
+      // bands are instead clamped to the storey the cut sits in, so other
+      // floors don't bleed onto the plan (e.g. a roof two levels up — the
+      // reported bug). Flip-invariant: the classifier applies the flip sign
+      // itself. Floor at 1mm so a degenerate zero-extent model (or a storey
+      // collapsed to a single slab) doesn't yield 0-width bands that cull every
+      // element sitting on the plane.
       const fullExtent = Math.max(axisMax - axisMin, 1e-3);
+      let belowDepth = fullExtent;
+      let aboveDepth = fullExtent;
+
+      // Auto-scope to the current floor only when it's safe and meaningful:
+      // a plan ('down') cut with projection on, a single model (storey ids are
+      // LOCAL express ids — federation would mismatch global mesh ids), no
+      // active manual isolation or storey selection (those already scope the
+      // set and the user's explicit choice wins), spatial-hierarchy data
+      // present (absent on cache-reopened models), and at most ONE building.
+      // A single IFC can hold several IfcBuildings with staggered storey
+      // elevations; flattening all their storey minima into one band mis-scopes
+      // (a cut on building B's ground floor capped by building A's upper
+      // storey), so multi-building models fall back to full extent too.
+      // Otherwise keep the shipped full-extent behavior so single-storey /
+      // cache-loaded / federated / multi-building models don't regress.
+      const sh = ifcDataStore?.spatialHierarchy;
+      const canScopeFloor =
+        projectionOn &&
+        sectionPlane.axis === 'down' &&
+        !sectionPlane.custom &&
+        models.size <= 1 &&
+        combinedIsolatedIds === null &&
+        !(computedIsolatedIds && computedIsolatedIds.size > 0) &&
+        sh !== undefined &&
+        sh.byBuilding.size <= 1;
+      if (canScopeFloor && sh) {
+        const cached = storeyFloorsCacheRef.current;
+        const floors =
+          cached && cached.sourceId === modelCacheKey
+            ? cached.floors
+            : storeyFloorsFromMeshes(geometryResult.meshes, sh.elementToStorey);
+        if (!cached || cached.sourceId !== modelCacheKey) {
+          storeyFloorsCacheRef.current = { floors, sourceId: modelCacheKey };
+        }
+        // Need ≥2 storeys to scope: with 0/1 storey there is no "other floor"
+        // to exclude, and full extent keeps an overhead roof projecting.
+        if (floors.length >= 2) {
+          // `currentFloorBands` returns GEOMETRIC depths — `below` toward the
+          // floor, `above` toward the ceiling. The band classifier reads them
+          // in FLIP-ADJUSTED depth space (d<0 = `below` slot), so on a flipped
+          // plan cut (looking up — a reflected-ceiling-plan style view) the
+          // floor/ceiling map to the opposite slots and the magnitudes must be
+          // swapped. The shipped full-extent bands were symmetric so this never
+          // mattered before; the asymmetric storey bands make flip significant.
+          const bands = currentFloorBands(floors, position, axisMin, axisMax);
+          belowDepth = sectionPlane.flipped ? bands.above : bands.below;
+          aboveDepth = sectionPlane.flipped ? bands.below : bands.above;
+        }
+      }
+
+      // Vertical section (front/side): storeys don't bound it. Project a
+      // bounded view depth BEHIND the cut and cull the cut-away front half +
+      // anything past that depth. "Behind" is always the `below` (d<0) band:
+      // the band classifier's flip and the view direction's flip cancel, so
+      // this is flip-invariant (no swap needed). Near geometry draws solid;
+      // the hidden-line pass dashes occluded/far parts. (Profiles aren't
+      // extracted off-plan, so this geometry comes from the mesh silhouette.)
+      if (projectionOn && !sectionPlane.custom && sectionPlane.axis !== 'down') {
+        belowDepth = Math.max((axisMax - axisMin) * SECTION_VIEW_DEPTH_FRACTION, 1e-3);
+        aboveDepth = 1e-3; // cull the half in front of the cut
+      }
 
       // Adjust progress to account for symbolic parsing phase (0-20%)
       const progressOffset = symbolicLines.length > 0 ? 20 : 0;
@@ -505,8 +600,8 @@ export function useDrawingGeneration({
       // Create section config
       const config: SectionConfig = createSectionConfig(axis, position, {
         projectionDepth: maxDepth,
-        projectionBelowDepth: fullExtent,
-        projectionAboveDepth: fullExtent,
+        projectionBelowDepth: belowDepth,
+        projectionAboveDepth: aboveDepth,
         includeHiddenLines: displayOptions.showHiddenLines,
         scale: displayOptions.scale,
       });
