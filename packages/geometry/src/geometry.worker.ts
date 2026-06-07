@@ -333,40 +333,49 @@ function collectMeshes(
   session: ProcessingSession,
   collection: ReturnType<IfcAPI['processGeometryBatch']>,
 ): void {
-  for (let i = 0; i < collection.length; i++) {
-    const mesh = collection.get(i);
-    if (!mesh) continue;
-    const positions = new Float32Array(mesh.positions);
-    const normals = new Float32Array(mesh.normals);
-    const indices = new Uint32Array(mesh.indices);
-    const meshData: MeshData = {
-      expressId: mesh.expressId,
-      ifcType: mesh.ifcType,
-      positions, normals, indices,
-      color: [mesh.color[0], mesh.color[1], mesh.color[2], mesh.color[3]],
-    };
-    session.pendingTransfers.push(positions.buffer, normals.buffer, indices.buffer);
-    session.cumulativeMeshBytes += positions.byteLength + normals.byteLength + indices.byteLength;
-    // #961: surface texture + per-vertex UVs (decoded to RGBA8 in Rust). Carried
-    // as transferables so there is no SAB→scratch copy (see SAB-streaming memo).
-    if (mesh.hasTexture) {
-      const uvs = new Float32Array(mesh.uvs);
-      const rgba = new Uint8Array(mesh.textureRgba);
-      meshData.uvs = uvs;
-      meshData.texture = {
-        rgba,
-        width: mesh.textureWidth,
-        height: mesh.textureHeight,
-        repeatS: mesh.textureRepeatS,
-        repeatT: mesh.textureRepeatT,
-      };
-      session.pendingTransfers.push(uvs.buffer, rgba.buffer);
-      session.cumulativeMeshBytes += uvs.byteLength + rgba.byteLength;
+  try {
+    for (let i = 0; i < collection.length; i++) {
+      const mesh = collection.get(i);
+      if (!mesh) continue;
+      try {
+        const positions = new Float32Array(mesh.positions);
+        const normals = new Float32Array(mesh.normals);
+        const indices = new Uint32Array(mesh.indices);
+        // Read the WASM copy-to-JS color getter once; indexing it directly
+        // would copy a fresh Float32Array out of WASM per access.
+        const color = mesh.color;
+        const meshData: MeshData = {
+          expressId: mesh.expressId,
+          ifcType: mesh.ifcType,
+          positions, normals, indices,
+          color: [color[0], color[1], color[2], color[3]],
+        };
+        session.pendingTransfers.push(positions.buffer, normals.buffer, indices.buffer);
+        session.cumulativeMeshBytes += positions.byteLength + normals.byteLength + indices.byteLength;
+        // #961: surface texture + per-vertex UVs (decoded to RGBA8 in Rust). Carried
+        // as transferables so there is no SAB→scratch copy (see SAB-streaming memo).
+        if (mesh.hasTexture) {
+          const uvs = new Float32Array(mesh.uvs);
+          const rgba = new Uint8Array(mesh.textureRgba);
+          meshData.uvs = uvs;
+          meshData.texture = {
+            rgba,
+            width: mesh.textureWidth,
+            height: mesh.textureHeight,
+            repeatS: mesh.textureRepeatS,
+            repeatT: mesh.textureRepeatT,
+          };
+          session.pendingTransfers.push(uvs.buffer, rgba.buffer);
+          session.cumulativeMeshBytes += uvs.byteLength + rgba.byteLength;
+        }
+        session.pendingMeshes.push(meshData);
+      } finally {
+        mesh.free();
+      }
     }
-    session.pendingMeshes.push(meshData);
-    mesh.free();
+  } finally {
+    collection.free();
   }
-  collection.free();
 }
 
 /**

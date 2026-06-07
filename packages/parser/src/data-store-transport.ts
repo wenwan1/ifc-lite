@@ -249,6 +249,7 @@ export interface DataStoreTransport {
   schemaVersion: IfcDataStore['schemaVersion'];
   entityCount: number;
   parseTime: number;
+  lengthUnitScale?: number;
 
   entityIndex: {
     byId: CompactEntityIndexColumns;
@@ -401,6 +402,7 @@ export function toTransport(store: IfcDataStore): DataStoreTransportEnvelope {
     schemaVersion: store.schemaVersion,
     entityCount: store.entityCount,
     parseTime: store.parseTime,
+    lengthUnitScale: store.lengthUnitScale,
 
     entityIndex: {
       byId: compactEntityIndexToColumns(compactById),
@@ -477,6 +479,7 @@ export function fromTransport(payload: DataStoreTransport, source: Uint8Array): 
     schemaVersion: payload.schemaVersion,
     entityCount: payload.entityCount,
     parseTime: payload.parseTime,
+    lengthUnitScale: payload.lengthUnitScale,
 
     source,
     entityIndex,

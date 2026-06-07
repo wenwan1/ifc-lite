@@ -123,8 +123,13 @@ export function useIfcCache() {
       const result = await reader.read(cacheResult.buffer);
       const cacheReadTime = performance.now() - cacheLoadStart;
 
-      // Convert cache data store to viewer data store format
-      const dataStore = result.dataStore as any;
+      // Convert cache data store to viewer data store format.
+      // The cache reader emits a cache-shaped store; this function mutates it
+      // in place into the parser `IfcDataStore` the viewer requires (adding
+      // source, entityIndex, on-demand maps, spatialHierarchy). Cast through
+      // `unknown` to the target shape so the subsequent property writes stay
+      // type-checked against the parser types.
+      const dataStore = result.dataStore as unknown as IfcDataStore;
 
       // Restore the source buffer — required for on-demand property extraction
       // AND the lazy entity accessors (getEntity/getProperties/...). The web
