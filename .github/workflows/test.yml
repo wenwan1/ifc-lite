@@ -272,6 +272,8 @@ jobs:
         # silently consume the whole job budget.
         timeout-minutes: 5
         run: pnpm test:integration
+      - name: WASM contract tests (real processGeometryBatch boundary)
+        run: pnpm test:wasm-contract
 
   # Functional smoke of the real viewer: real WASM pipeline + WebGPU
   # renderer (swiftshader) + pick pass + section plane, asserted through
