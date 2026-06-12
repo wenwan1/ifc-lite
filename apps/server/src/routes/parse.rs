@@ -5,6 +5,7 @@
 //! Parse endpoints for IFC file processing.
 
 use crate::error::ApiError;
+use crate::services::streaming::detect_schema_version;
 use crate::services::{
     cache::DiskCache, extract_data_model, process_geometry_filtered, process_streaming,
     serialize_data_model_to_parquet, serialize_to_parquet,
@@ -252,7 +253,7 @@ pub async fn parse_full(
     tracing::info!(cache_key = %cache_key, size = data.len(), "Cache MISS - processing");
 
     // Parse content
-    let content = String::from_utf8(data)?;
+    let content = data;
     let opening_filter = query.opening_filter;
 
     // Process on blocking thread pool (CPU-intensive). Bundle the 3D
@@ -306,7 +307,7 @@ pub async fn parse_stream(
     // Extract file
     let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
-    let content = String::from_utf8(data)?;
+    let content = data;
     let initial_batch_size = state.config.initial_batch_size;
     let max_batch_size = state.config.max_batch_size;
 
@@ -384,9 +385,9 @@ pub async fn parse_parquet_stream(
     Query(query): Query<ParseQuery>,
     mut multipart: Multipart,
 ) -> Result<axum::response::Response, ApiError> {
-    use axum::response::IntoResponse;
     use crate::services::serialize_to_parquet;
     use crate::types::MeshData;
+    use axum::response::IntoResponse;
     use base64::{engine::general_purpose::STANDARD, Engine};
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -472,7 +473,7 @@ pub async fn parse_parquet_stream(
         "Streaming cache MISS - processing file"
     );
 
-    let content = String::from_utf8(data)?;
+    let content = data;
     let initial_batch_size = state.config.initial_batch_size;
     let max_batch_size = state.config.max_batch_size;
     let cache = state.cache.clone();
@@ -680,7 +681,7 @@ pub async fn parse_metadata(
     let data = extract_file(&mut multipart, state.config.max_file_size_mb).await?;
 
     let file_size = data.len();
-    let content = String::from_utf8(data)?;
+    let content = data;
 
     // Fast path - just scan entities, no geometry processing
     let result = tokio::task::spawn_blocking(move || {
@@ -695,14 +696,7 @@ pub async fn parse_metadata(
             }
         }
 
-        // Detect schema version
-        let schema_version = if content.contains("IFC4X3") {
-            "IFC4X3"
-        } else if content.contains("IFC4") {
-            "IFC4"
-        } else {
-            "IFC2X3"
-        };
+        let schema_version = detect_schema_version(&content);
 
         MetadataResponse {
             entity_count,
@@ -779,7 +773,11 @@ pub async fn parse_parquet(
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/x-parquet-geometry")
-            .header("X-IFC-Metadata", String::from_utf8(cached_metadata_json)?)
+            .header(
+                "X-IFC-Metadata",
+                String::from_utf8(cached_metadata_json)
+                    .map_err(|error| ApiError::Internal(error.to_string()))?,
+            )
             .header(header::CONTENT_LENGTH, cached_parquet.len())
             .body(Body::from(cached_parquet))
             .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -794,15 +792,18 @@ pub async fn parse_parquet(
     );
 
     // Parse content
-    let content = String::from_utf8(data)?;
+    let content = data;
 
     // Process geometry and data model extraction + serialization ALL in parallel
     // rayon::join works correctly here because rayon has its own thread pool
     // that's independent of tokio's blocking thread pool
     let serialize_start = tokio::time::Instant::now();
     let opening_filter = query.opening_filter;
-    let ((geometry_result, geometry_parquet), (data_model_stats, data_model_parquet), symbolic_data) =
-        tokio::task::spawn_blocking(move || {
+    let (
+        (geometry_result, geometry_parquet),
+        (data_model_stats, data_model_parquet),
+        symbolic_data,
+    ) = tokio::task::spawn_blocking(move || {
             // First: extract geometry, data model, and the 2D symbol stream
             // (IfcAnnotation + IfcGrid) all in parallel. Symbolic extraction is
             // added here for endpoint parity (issue #900).
@@ -981,7 +982,7 @@ pub async fn parse_parquet_optimized(
     );
 
     // Parse content
-    let content = String::from_utf8(data)?;
+    let content = data;
     let opening_filter = query.opening_filter;
 
     // Process on blocking thread pool (CPU-intensive). Extract the 2D symbol
@@ -1225,7 +1226,11 @@ pub async fn get_cached_geometry(
             let response = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/x-parquet-geometry")
-                .header("X-IFC-Metadata", String::from_utf8(metadata)?)
+                .header(
+                    "X-IFC-Metadata",
+                    String::from_utf8(metadata)
+                        .map_err(|error| ApiError::Internal(error.to_string()))?,
+                )
                 .header(header::CONTENT_LENGTH, parquet.len())
                 .body(Body::from(parquet))
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
@@ -1317,5 +1322,18 @@ mod tests {
     fn symbolic_cache_key_default_filter() {
         let key = symbolic_cache_key("abc-default");
         assert_eq!(key, "abc-default-symbolic-v1");
+    }
+
+    #[test]
+    fn schema_detection_uses_file_schema_declaration_only() {
+        let content = b"ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCDOCUMENTINFORMATION('IFC4X3',$,$,$,$,$,$,$,$,$,$,$,$,$,$,$,$);
+ENDSEC;";
+
+        assert_eq!(detect_schema_version(content), "IFC2X3");
     }
 }
