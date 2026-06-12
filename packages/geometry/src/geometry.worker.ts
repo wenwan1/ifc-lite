@@ -23,25 +23,11 @@ export interface GeometryWorkerInitMessage {
   wasmUrl?: string;
 }
 
-export interface GeometryWorkerProcessMessage {
-  type: 'process';
-  sharedBuffer: SharedArrayBuffer;
-  jobsFlat: Uint32Array;      // [id, start, end, id, start, end, ...]
-  unitScale: number;
-  rtcX: number; rtcY: number; rtcZ: number;
-  needsShift: boolean;
-  voidKeys: Uint32Array;
-  voidCounts: Uint32Array;
-  voidValues: Uint32Array;
-  styleIds: Uint32Array;
-  styleColors: Uint8Array;
-}
-
 /**
- * Streaming-mode counterpart to `process`. The host sends `stream-start`
- * once with the same metadata (minus jobs), then any number of
- * `stream-chunk` messages with new job slices, and finally `stream-end`
- * to trigger the worker's `complete` + `memory` emit.
+ * The host sends `stream-start` once with the session metadata (minus
+ * jobs), then any number of `stream-chunk` messages with new job slices,
+ * and finally `stream-end` to trigger the worker's `complete` + `memory`
+ * emit.
  *
  * Used by the streaming pre-pass path so workers can begin processing
  * jobs the moment the first chunk arrives from Rust, rather than waiting
@@ -100,9 +86,9 @@ export interface GeometryWorkerSetEntityIndexMessage {
 }
 
 export interface GeometryWorkerPrePassMessage {
-  type: 'prepass' | 'prepass-fast' | 'prepass-streaming';
+  type: 'prepass-streaming';
   sharedBuffer: SharedArrayBuffer;
-  /** Jobs per chunk for `prepass-streaming` (defaults to 50_000). */
+  /** Jobs per chunk (defaults to 50_000). */
   chunkSize?: number;
 }
 
@@ -145,7 +131,6 @@ export interface GeometryWorkerSetTessellationQualityMessage {
 
 export type GeometryWorkerRequest =
   | GeometryWorkerInitMessage
-  | GeometryWorkerProcessMessage
   | GeometryWorkerStreamStartMessage
   | GeometryWorkerStreamChunkMessage
   | GeometryWorkerStreamEndMessage
@@ -165,6 +150,7 @@ export interface GeometryWorkerBatchMessage {
     normals: Float32Array;
     indices: Uint32Array;
     color: [number, number, number, number];
+    shadingColor?: [number, number, number, number];
     // #961: optional surface texture + per-vertex UVs (transferables).
     uvs?: MeshData['uvs'];
     texture?: MeshData['texture'];
@@ -424,12 +410,22 @@ function collectMeshes(
         // Read the WASM copy-to-JS color getter once; indexing it directly
         // would copy a fresh Float32Array out of WASM per access.
         const color = mesh.color;
+        // Optional SurfaceColour for the GLB exporter's "Shading" mode —
+        // parity with the single-thread converter in geometry-coordinate.ts
+        // (the worker path silently dropped it, degrading "Shading" export
+        // on the DEFAULT load path — alignment audit).
+        const shadingArray = mesh.shadingColor;
+        const shadingColor: [number, number, number, number] | undefined =
+          shadingArray && shadingArray.length === 4
+            ? [shadingArray[0], shadingArray[1], shadingArray[2], shadingArray[3]]
+            : undefined;
         const geometryHash = geometryHashes.get(mesh.expressId);
         const meshData: MeshData = {
           expressId: mesh.expressId,
           ifcType: mesh.ifcType,
           positions, normals, indices,
           color: [color[0], color[1], color[2], color[3]],
+          ...(shadingColor ? { shadingColor } : {}),
           // Provenance for the Model/Types switch (0=occurrence, 1=orphan type,
           // 2=instanced type). Older wasm bundles lack the getter → default 0.
           geometryClass: mesh.geometryClass ?? 0,
@@ -590,9 +586,9 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       const chunkSize = e.data.chunkSize ?? 50_000;
 
       // Forward Rust events 1:1 — the host (`geometry-parallel.ts`) treats
-      // them as the streaming-prepass protocol. SAB-decode fallback mirrors
-      // the existing `buildPrePassFast` path: try zero-copy view first, fall
-      // back to a materialised copy only if wasm-bindgen rejects the view.
+      // them as the streaming-prepass protocol. SAB-decode fallback: try the
+      // zero-copy view first, fall back to a materialised copy only if
+      // wasm-bindgen rejects the view.
       let view = viewSharedBytes(sharedBuffer);
       let triedFallback = false;
       const onEvent = (event: unknown) => {
@@ -614,33 +610,6 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
       return;
     }
 
-    if (e.data.type === 'prepass' || e.data.type === 'prepass-fast') {
-      const ifcApi = await ensureInit();
-      // Heartbeat: signals "worker alive, parser running" so the host watchdog
-      // can distinguish a stuck pre-pass from one that's still working on a
-      // multi-GB file.
-      (self as unknown as Worker).postMessage({ type: 'prepass-progress', phase: 'parsing' });
-      const sharedBuffer = e.data.sharedBuffer;
-      const isFast = e.data.type === 'prepass-fast';
-      // Fast pre-pass: only scan for entity locations (~1-2s)
-      // Full pre-pass: also resolves styles + voids (~6s)
-      let result: ReturnType<IfcAPI['buildPrePassOnce']>;
-      try {
-        const view = viewSharedBytes(sharedBuffer);
-        result = isFast ? ifcApi.buildPrePassFast(view) : ifcApi.buildPrePassOnce(view);
-      } catch (err) {
-        // wasm-bindgen on some runtimes rejects SAB-backed views with a
-        // TypeError. Retry once with a materialised copy so we never regress
-        // versus the previous behaviour.
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[Worker] Prepass with SAB view failed (${msg}), retrying with copy`);
-        const copy = materialiseSharedBytes(sharedBuffer);
-        result = isFast ? ifcApi.buildPrePassFast(copy) : ifcApi.buildPrePassOnce(copy);
-      }
-      (self as unknown as Worker).postMessage({ type: 'prepass-result', result });
-      return;
-    }
-
     if (e.data.type === 'init') {
       if (e.data.wasmUrl) cachedWasmUrl = e.data.wasmUrl;
       if (e.data.wasmModule) {
@@ -656,21 +625,6 @@ async function handleMessage(e: MessageEvent<GeometryWorkerRequest>): Promise<vo
         await ensureInit();
       }
       (self as unknown as Worker).postMessage({ type: 'ready' });
-      return;
-    }
-
-    if (e.data.type === 'process') {
-      await ensureInit();
-      const { sharedBuffer, jobsFlat, unitScale, rtcX, rtcY, rtcZ, needsShift,
-              voidKeys, voidCounts, voidValues, styleIds, styleColors } = e.data;
-      const session = startSession({
-        sharedBuffer, unitScale, rtcX, rtcY, rtcZ, needsShift,
-        voidKeys, voidCounts, voidValues, styleIds, styleColors,
-      });
-      activeSession = session;
-      await processSliceStreaming(session, jobsFlat);
-      emitSessionEnd(session);
-      activeSession = null;
       return;
     }
 

@@ -12,9 +12,10 @@ use crate::types::response::{
     QuickMetadataEntitySummary, QuickMetadataSpatialNode,
 };
 use ifc_lite_core::{
-    build_entity_index, scan_placement_bounds, AttributeValue, DecodedEntity, EntityDecoder,
+    build_entity_index, AttributeValue, DecodedEntity, EntityDecoder,
     EntityIndex, EntityScanner, IfcType,
 };
+use ifc_lite_geometry::TessellationQuality;
 use ifc_lite_geometry::{calculate_normals, GeometryRouter};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -76,6 +77,13 @@ pub struct StreamingOptions {
     pub emit_quick_metadata_bootstrap: bool,
     /// Retain emitted meshes in the returned ProcessingResult.
     pub retain_emitted_meshes: bool,
+    /// Tessellation detail level (#976). `Medium` reproduces the historical
+    /// output byte-for-byte; consumer-selectable on the wasm path via
+    /// `setTessellationQuality`, and on the server via the
+    /// `tessellation_quality` query parameter. 2D symbolic extraction
+    /// (`symbolic.rs`) deliberately ignores the level — symbols are
+    /// resolution-independent line work.
+    pub tessellation_quality: TessellationQuality,
 }
 
 impl Default for StreamingOptions {
@@ -88,6 +96,7 @@ impl Default for StreamingOptions {
             include_presentation_layers: true,
             emit_quick_metadata_bootstrap: false,
             retain_emitted_meshes: true,
+            tessellation_quality: TessellationQuality::default(),
         }
     }
 }
@@ -744,12 +753,24 @@ pub fn process_geometry_streaming_with_options_and_bootstrap(
 
 /// Process IFC content with parallel geometry extraction and a configurable opening filter.
 pub fn process_geometry_filtered(content: &str, opening_filter: OpeningFilterMode) -> ProcessingResult {
+    process_geometry_filtered_with_quality(content, opening_filter, TessellationQuality::default())
+}
+
+/// Like [`process_geometry_filtered`] with a consumer-selected tessellation
+/// detail level (#976) — the server half of the quality knob the wasm path
+/// exposes via `setTessellationQuality`.
+pub fn process_geometry_filtered_with_quality(
+    content: &str,
+    opening_filter: OpeningFilterMode,
+    tessellation_quality: TessellationQuality,
+) -> ProcessingResult {
     process_geometry_streaming_filtered_with_options(
         content,
         opening_filter,
         StreamingOptions {
             initial_batch_size: usize::MAX,
             throughput_batch_size: usize::MAX,
+            tessellation_quality,
             ..StreamingOptions::default()
         },
         |_, _, _| {},
@@ -824,7 +845,6 @@ pub fn process_geometry_streaming_filtered_with_options(
 
     // Collect geometry entities and build void index
     let mut scanner = EntityScanner::new(content);
-    let mut faceted_brep_ids: Vec<u32> = Vec::new();
     let mut void_index: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut filling_by_opening: FxHashMap<u32, u32> = FxHashMap::default();
     // Parent → aggregated children, used to propagate void cuts from a
@@ -1047,8 +1067,6 @@ pub fn process_geometry_streaming_filtered_with_options(
                 }
             }
             continue;
-        } else if type_name == "IFCFACETEDBREP" {
-            faceted_brep_ids.push(id);
         } else if type_name == "IFCRELVOIDSELEMENT" {
             if let Ok(entity) = decoder.decode_at(start, end) {
                 if let (Some(host), Some(opening)) = (entity.get_ref(4), entity.get_ref(5)) {
@@ -1190,7 +1208,7 @@ pub fn process_geometry_streaming_filtered_with_options(
     // aggregated descendant so the part meshes get the cut. Without this
     // propagation the cut silently no-ops (the host has nothing to clip)
     // and panels/studs cover what should be the window/door hole.
-    propagate_voids_to_aggregated_parts(&mut void_index, &aggregate_children);
+    ifc_lite_geometry::propagate_voids_via_aggregates(&mut void_index, &aggregate_children);
 
     let entity_scan_time = entity_scan_start.elapsed();
 
@@ -1230,7 +1248,6 @@ pub fn process_geometry_streaming_filtered_with_options(
     tracing::info!(
         total_entities = total_entities,
         geometry_entities = geometry_entity_count,
-        faceted_breps = faceted_brep_ids.len(),
         voids = void_index.len(),
         schema_version = %schema_version,
         "Entity scanning complete"
@@ -1282,6 +1299,7 @@ pub fn process_geometry_streaming_filtered_with_options(
     // Preprocess complex geometry
     let preprocess_start = std::time::Instant::now();
     let mut router = GeometryRouter::with_units(content, &mut decoder);
+    router.set_tessellation_quality(options.tessellation_quality);
 
     // Resolve IfcSite and IfcBuilding placement transforms.
     let site_transform: Option<Vec<f64>> = site_entity_pos.and_then(|(start, end)| {
@@ -1303,10 +1321,8 @@ pub fn process_geometry_streaming_filtered_with_options(
         .iter()
         .map(|job| (job.id, job.start, job.end, job.ifc_type))
         .collect();
-    let detected_rtc_offset = match router.detect_rtc_offset_from_jobs(&rtc_jobs, &mut decoder) {
-        Some(offset) => offset,
-        None => scan_placement_bounds(content).rtc_offset(),
-    };
+    let detected_rtc_offset =
+        router.detect_rtc_offset_with_fallback(&rtc_jobs, &mut decoder, content);
 
     // Three-tier coordinate-space selection:
     //   1. `site_local`: IfcSite placement has a non-identity translation.
@@ -1330,12 +1346,6 @@ pub fn process_geometry_streaming_filtered_with_options(
     };
     let has_rtc_offset = coord_space != RAW_IFC_MESH_COORDINATE_SPACE;
     router.set_rtc_offset(rtc_offset);
-    let should_preprocess_faceted_breps = !faceted_brep_ids.is_empty()
-        && !(options.fast_first_batch && options.initial_batch_size < usize::MAX);
-    if should_preprocess_faceted_breps {
-        tracing::debug!(count = faceted_brep_ids.len(), "Preprocessing FacetedBreps");
-        router.preprocess_faceted_breps(&faceted_brep_ids, &mut decoder);
-    }
     let preprocess_time = preprocess_start.elapsed();
 
     let parse_time = parse_start.elapsed();
@@ -1398,6 +1408,11 @@ pub fn process_geometry_streaming_filtered_with_options(
     let mut current_chunk_size = initial_chunk_size;
 
     let mut deferred_styles_applied = !defer_style_updates;
+
+    // CSG-diagnostics sink shared across all per-job routers (drained after
+    // the loop into ProcessingStats + one tracing summary).
+    let csg_failure_collector: std::sync::Mutex<FxHashMap<u32, Vec<ifc_lite_geometry::BoolFailure>>> =
+        std::sync::Mutex::new(FxHashMap::default());
 
     while chunk_start < total_jobs {
         let chunk_end = (chunk_start + current_chunk_size).min(total_jobs);
@@ -1493,6 +1508,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     &entity_index_arc,
                     unit_scale,
                     rtc_offset,
+                    options.tessellation_quality,
                     void_index_arc.as_ref(),
                     skipped_entity_ids.as_ref(),
                     geometry_style_index.as_ref(),
@@ -1500,6 +1516,7 @@ pub fn process_geometry_streaming_filtered_with_options(
                     element_material_colors.as_ref(),
                     texture_index.as_ref(),
                     site_local_rotation,
+                    &csg_failure_collector,
                 )
             })
             .collect();
@@ -1549,6 +1566,35 @@ pub fn process_geometry_streaming_filtered_with_options(
     }
 
     let geometry_time = geometry_start.elapsed();
+    // Surface the aggregated CSG diagnostics — same per-reason breakdown the
+    // browser console shows on the wasm path.
+    let csg_failures = csg_failure_collector
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let total_csg_failures: usize = csg_failures.values().map(Vec::len).sum();
+    let products_with_failures = csg_failures.len();
+    if total_csg_failures > 0 {
+        let mut by_reason: HashMap<&'static str, usize> = HashMap::new();
+        for fails in csg_failures.values() {
+            for f in fails {
+                *by_reason.entry(f.reason.label()).or_insert(0) += 1;
+            }
+        }
+        let mut breakdown: Vec<(&'static str, usize)> = by_reason.into_iter().collect();
+        breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+        let breakdown = breakdown
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::warn!(
+            total_csg_failures,
+            products_with_failures,
+            %breakdown,
+            "CSG failures during geometry extraction (cut dropped, host kept uncut)"
+        );
+    }
+
     let total_time = total_start.elapsed();
 
     tracing::info!(
@@ -1587,6 +1633,8 @@ pub fn process_geometry_streaming_filtered_with_options(
             geometry_time_ms: geometry_time.as_millis() as u64,
             total_time_ms: total_time.as_millis() as u64,
             from_cache: false,
+            total_csg_failures: total_csg_failures as u64,
+            products_with_failures: products_with_failures as u64,
         },
     }
 }
@@ -1597,6 +1645,7 @@ fn process_entity_job(
     entity_index_arc: &Arc<EntityIndex>,
     unit_scale: f64,
     rtc_offset: (f64, f64, f64),
+    tessellation_quality: TessellationQuality,
     void_index: &FxHashMap<u32, Vec<u32>>,
     skipped_entity_ids: &HashSet<u32>,
     geometry_style_index: &FxHashMap<u32, GeometryStyleInfo>,
@@ -1608,6 +1657,9 @@ fn process_entity_job(
     // Present only when the selected coordinate space is `site_local`; rotates
     // mesh vertices into the site's axis frame.
     site_local_rotation: Option<&Vec<f64>>,
+    // Shared sink for per-job router CSG diagnostics (parity with the wasm
+    // path's `drain_and_log_csg_diagnostics`).
+    csg_failure_collector: &std::sync::Mutex<FxHashMap<u32, Vec<ifc_lite_geometry::BoolFailure>>>,
 ) -> Vec<MeshData> {
     if skipped_entity_ids.contains(&job.id) {
         return Vec::new();
@@ -1625,7 +1677,10 @@ fn process_entity_job(
         return Vec::new();
     }
 
-    let local_router = GeometryRouter::with_scale_and_rtc(unit_scale, rtc_offset);
+    let mut local_router = GeometryRouter::with_scale_and_quality(unit_scale, tessellation_quality);
+    local_router.set_rtc_offset(rtc_offset);
+    let local_router = local_router;
+    let result = (|| -> Vec<MeshData> {
     let global_id = job.global_id.clone();
     let name = job.name.clone();
     let presentation_layer = job.presentation_layer.clone();
@@ -1651,73 +1706,120 @@ fn process_entity_job(
         );
     }
 
-    if is_opening_with_subparts(&job.ifc_type) {
-        if let Ok(sub_meshes) = local_router.process_element_with_submeshes(&entity, &mut local_decoder) {
+    let has_openings = void_index.get(&job.id).is_some_and(|v| !v.is_empty());
+
+    // Shared per-sub emission: per-item colour resolution through the
+    // canonical `resolve_submesh_color` precedence (#913 §4.2), identical to
+    // the wasm `processGeometryBatch` path so browser and backend can't
+    // drift on sub-mesh colouring.
+    let mut emit_sub_meshes = |sub_meshes: ifc_lite_geometry::SubMeshCollection,
+                               local_decoder: &mut EntityDecoder|
+     -> Vec<MeshData> {
+        let mut out: Vec<MeshData> = Vec::with_capacity(sub_meshes.len());
+        // Material colours for this element, used when a sub-mesh has no
+        // direct style — alternated so frame (opaque) and glazing
+        // (transparent) split across the window's parts (#913 §2.3).
+        let material_colors = element_material_colors.get(&job.id);
+        let mut mat_color_idx = 0usize;
+
+        for sub in sub_meshes.sub_meshes {
+            let mut sub_mesh = sub.mesh;
+            if sub_mesh.is_empty() {
+                continue;
+            }
+
+            if sub_mesh.normals.is_empty() {
+                calculate_normals(&mut sub_mesh);
+            }
+
+            let style = geometry_style_index.get(&sub.geometry_id);
+            // Direct style wins; else chase IfcMappedItem so mapped
+            // sub-geometry inherits its underlying style (#913 §2.7).
+            let direct_color = style.map(|s| s.color).or_else(|| {
+                find_geometry_item_color(sub.geometry_id, geometry_style_index, local_decoder)
+            });
+            let color = crate::style::resolve_submesh_color(
+                direct_color,
+                material_colors.map(|v| v.as_slice()),
+                &mut mat_color_idx,
+                element_color,
+            );
+            let material_name = style
+                .and_then(|s| s.material_name.as_ref())
+                .map(ToString::to_string);
+            let material_name = material_name.or_else(|| {
+                infer_opening_subpart_material_name(&job.ifc_type, color, sub.geometry_id)
+            });
+
+            let mut mesh_data = MeshData::new(
+                job.id,
+                job.ifc_type.name().to_string(),
+                sub_mesh.positions,
+                sub_mesh.normals,
+                sub_mesh.indices,
+                color,
+            )
+            .with_element_metadata(global_id.clone(), name.clone(), presentation_layer.clone())
+            .with_properties(space_zone_properties.clone())
+            .with_style_metadata(material_name, Some(sub.geometry_id));
+            convert_mesh_to_site_local(&mut mesh_data, site_local_rotation);
+            out.push(mesh_data);
+        }
+        out
+    };
+
+    if has_openings {
+        // Voided elements FIRST — branch order matches the wasm path, so a
+        // voided window is CUT rather than rendered uncut-as-subparts.
+        // Prefer the submesh-aware cut (per-part colours survive the void
+        // subtraction); the single-mesh cut below stays as the fallback.
+        if let Ok(sub_meshes) = local_router.process_element_with_submeshes_and_voids(
+            &entity,
+            &mut local_decoder,
+            void_index,
+        ) {
             if !sub_meshes.is_empty() {
-                let mut out: Vec<MeshData> = Vec::with_capacity(sub_meshes.len());
-                // Material colours for this element, used when a sub-mesh has no
-                // direct style — alternated so frame (opaque) and glazing
-                // (transparent) split across the window's parts (#913 §2.3).
-                let material_colors = element_material_colors.get(&job.id);
-                let mut mat_color_idx = 0usize;
-
-                for sub in sub_meshes.sub_meshes {
-                    let mut sub_mesh = sub.mesh;
-                    if sub_mesh.is_empty() {
-                        continue;
-                    }
-
-                    if sub_mesh.normals.is_empty() {
-                        calculate_normals(&mut sub_mesh);
-                    }
-
-                    let style = geometry_style_index.get(&sub.geometry_id);
-                    // Direct style wins; else chase IfcMappedItem so mapped
-                    // sub-geometry inherits its underlying style (#913 §2.7).
-                    let direct_color = style.map(|s| s.color).or_else(|| {
-                        find_geometry_item_color(
-                            sub.geometry_id,
-                            geometry_style_index,
-                            &mut local_decoder,
-                        )
-                    });
-                    // The shared resolver owns the precedence below the direct
-                    // style + the transparent/opaque alternation (#913 §4.2), so
-                    // the browser and the backend can't drift on it.
-                    let color = crate::style::resolve_submesh_color(
-                        direct_color,
-                        material_colors.map(|v| v.as_slice()),
-                        &mut mat_color_idx,
-                        element_color,
-                    );
-                    let material_name = style
-                        .and_then(|s| s.material_name.as_ref())
-                        .map(ToString::to_string);
-                    let material_name = material_name.or_else(|| {
-                        infer_opening_subpart_material_name(&job.ifc_type, color, sub.geometry_id)
-                    });
-
-                    let mut mesh_data = MeshData::new(
-                        job.id,
-                        job.ifc_type.name().to_string(),
-                        sub_mesh.positions,
-                        sub_mesh.normals,
-                        sub_mesh.indices,
-                        color,
-                    )
-                    .with_element_metadata(global_id.clone(), name.clone(), presentation_layer.clone())
-                    .with_properties(space_zone_properties.clone())
-                    .with_style_metadata(material_name, Some(sub.geometry_id));
-                    convert_mesh_to_site_local(&mut mesh_data, site_local_rotation);
-                    out.push(mesh_data);
-                }
-
+                let out = emit_sub_meshes(sub_meshes, &mut local_decoder);
                 if !out.is_empty() {
                     return out;
                 }
             }
         }
+    } else {
+        // #858: an IfcIndexedColourMap colours faces of a single face set —
+        // those elements keep the single-mesh + palette-split path below.
+        let has_indexed_colour = !indexed_colour_full.is_empty()
+            && find_indexed_colour_for_element(&entity, indexed_colour_full, &mut local_decoder)
+                .is_some();
+        if !has_indexed_colour {
+            // Submesh path for ALL types (parity with `processGeometryBatch`):
+            // per-item colours AND per-item error skipping — one unsupported
+            // representation item no longer makes the whole element invisible
+            // in server/parquet output while it renders partially in the
+            // browser.
+            if let Ok(sub_meshes) =
+                local_router.process_element_with_submeshes(&entity, &mut local_decoder)
+            {
+                if !sub_meshes.is_empty() {
+                    let out = emit_sub_meshes(sub_meshes, &mut local_decoder);
+                    if !out.is_empty() {
+                        return out;
+                    }
+                }
+            }
+        }
     }
+
+    // A superseding strategy is about to re-process this element's
+    // representation and re-attempt the same (deterministic) cuts/booleans.
+    // Discard the abandoned attempt's diagnostics so only the path that
+    // actually produced the returned meshes contributes to
+    // total_csg_failures / products_with_failures — otherwise re-failures
+    // are double-counted. (`take_csg_failures` is the drain == clear; the
+    // voids→plain-element mini-fallback below intentionally keeps its
+    // records: a failed/emptying cut that leaves the host uncut IS the
+    // diagnostic.)
+    let _ = local_router.take_csg_failures();
 
     let mut mesh_candidate = local_router
         .process_element_with_voids(&entity, &mut local_decoder, void_index)
@@ -1792,6 +1894,24 @@ fn process_entity_job(
     }
 
     Vec::new()
+    })();
+
+    // Drain the per-job router's CSG diagnostics into the shared collector
+    // BEFORE the router drops. The wasm path surfaces these in the browser
+    // console (`drain_and_log_csg_diagnostics`); without this drain the
+    // server silently discarded every failed opening cut, and the
+    // thread-local pending mapped-boolean buffer accumulated across
+    // requests on the long-lived rayon pool threads.
+    let failures = local_router.take_csg_failures();
+    if !failures.is_empty() {
+        if let Ok(mut collector) = csg_failure_collector.lock() {
+            for (product_id, fails) in failures {
+                collector.entry(product_id).or_default().extend(fails);
+            }
+        }
+    }
+
+    result
 }
 
 /// Render an orphan type-product `IfcRepresentationMap` (issue #957).
@@ -2288,65 +2408,6 @@ fn normalize_style_name(raw: Option<&str>) -> Option<String> {
     Some(name.to_string())
 }
 
-/// Propagate openings from hosts that aggregate parts (IfcWallElementedCase
-/// pattern) to every aggregated descendant. The IFC4 spec allows an opening
-/// on a host whose geometry is distributed across aggregated parts; without
-/// propagation the cut runs against an empty host mesh and produces a
-/// "silent no-op" warning while panels/studs cover what should be the
-/// window/door hole.
-///
-/// Propagation is breadth-first with a visited-set cycle guard.
-/// Existing void entries for a part are extended (deduplicated) so we never
-/// overwrite an authored direct void.
-fn propagate_voids_to_aggregated_parts(
-    void_index: &mut FxHashMap<u32, Vec<u32>>,
-    aggregate_children: &FxHashMap<u32, Vec<u32>>,
-) {
-    if void_index.is_empty() || aggregate_children.is_empty() {
-        return;
-    }
-
-    // Snapshot host ids first — we mutate void_index inside the loop.
-    let hosts: Vec<u32> = void_index.keys().copied().collect();
-
-    for host in hosts {
-        let openings = match void_index.get(&host) {
-            Some(list) if !list.is_empty() => list.clone(),
-            _ => continue,
-        };
-
-        // BFS over aggregated descendants of `host`. Skip the host itself.
-        let mut stack: Vec<u32> = match aggregate_children.get(&host) {
-            Some(kids) => kids.clone(),
-            None => continue,
-        };
-        let mut seen: HashSet<u32> = HashSet::default();
-        seen.insert(host);
-
-        while let Some(part) = stack.pop() {
-            if !seen.insert(part) {
-                continue;
-            }
-
-            // Mirror the openings onto this part, deduplicated.
-            let entry = void_index.entry(part).or_default();
-            for opening in &openings {
-                if !entry.contains(opening) {
-                    entry.push(*opening);
-                }
-            }
-
-            if let Some(grand_kids) = aggregate_children.get(&part) {
-                for kid in grand_kids {
-                    if !seen.contains(kid) {
-                        stack.push(*kid);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Apply the opening filter and return which entity IDs to suppress and a filtered void index.
 ///
 /// Returns `(skipped_entity_ids, filtered_void_index)` where:
@@ -2618,65 +2679,4 @@ END-ISO-10303-21;
         assert_eq!(find_geometry_item_color(101, &styles, &mut decoder), None);
     }
 
-    #[test]
-    fn propagate_voids_walks_full_aggregate_tree() {
-        // Host #100 voided by openings #200 and #201. The host aggregates
-        // parts #110 and #111; #110 further aggregates #120 (a grand-part).
-        // Every leaf in the aggregate sub-tree must inherit both openings.
-        let mut void_index = map(&[(100, &[200, 201])]);
-        let aggregate_children = map(&[(100, &[110, 111]), (110, &[120])]);
-
-        propagate_voids_to_aggregated_parts(&mut void_index, &aggregate_children);
-
-        let expected = [200, 201];
-        for part in &[110, 111, 120] {
-            let got = void_index.get(part).expect("part should have voids");
-            assert_eq!(
-                got.iter().copied().collect::<std::collections::HashSet<_>>(),
-                expected.iter().copied().collect::<std::collections::HashSet<_>>(),
-                "part #{part} should receive both openings",
-            );
-        }
-        // Host entry is preserved untouched.
-        assert_eq!(void_index.get(&100), Some(&vec![200, 201]));
-    }
-
-    #[test]
-    fn propagate_voids_deduplicates_existing_part_voids() {
-        // Authored: part #110 already voided by opening #999 directly.
-        // After propagation it must have #200 and #999, not #200 twice.
-        let mut void_index = map(&[(100, &[200]), (110, &[999])]);
-        let aggregate_children = map(&[(100, &[110])]);
-
-        propagate_voids_to_aggregated_parts(&mut void_index, &aggregate_children);
-
-        let mut part_voids = void_index.get(&110).unwrap().clone();
-        part_voids.sort();
-        assert_eq!(part_voids, vec![200, 999]);
-    }
-
-    #[test]
-    fn propagate_voids_handles_aggregate_cycles() {
-        // Cyclic IfcRelAggregates: #110 -> #120 -> #110. Without the visited
-        // guard this loops forever. With it the walk terminates and both
-        // parts get the openings exactly once.
-        let mut void_index = map(&[(100, &[200])]);
-        let aggregate_children = map(&[(100, &[110]), (110, &[120]), (120, &[110])]);
-
-        propagate_voids_to_aggregated_parts(&mut void_index, &aggregate_children);
-
-        assert_eq!(void_index.get(&110), Some(&vec![200]));
-        assert_eq!(void_index.get(&120), Some(&vec![200]));
-    }
-
-    #[test]
-    fn propagate_voids_no_op_when_host_has_no_parts() {
-        let mut void_index = map(&[(100, &[200])]);
-        let aggregate_children = map(&[(101, &[110])]); // different host
-        let before = void_index.clone();
-
-        propagate_voids_to_aggregated_parts(&mut void_index, &aggregate_children);
-
-        assert_eq!(void_index, before);
-    }
 }

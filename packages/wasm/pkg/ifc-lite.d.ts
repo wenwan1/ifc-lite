@@ -83,13 +83,6 @@ export class IfcAPI {
   free(): void;
   [Symbol.dispose](): void;
   /**
-   * Fast pre-pass: scans for geometry entities ONLY (skips style/void/material resolution).
-   * Returns job list + unit scale + RTC offset in ~1-2s instead of ~6s.
-   * Geometry workers can start immediately with default colors + no void subtraction.
-   * A parallel style worker can run buildPrePassOnce for correct colors later.
-   */
-  buildPrePassFast(data: Uint8Array): any;
-  /**
    * Run the pre-pass ONCE and return serialized results for worker distribution.
    * Takes raw bytes (&[u8]) to avoid TextDecoder overhead.
    */
@@ -105,9 +98,8 @@ export class IfcAPI {
    *
    * Single linear walk over the file:
    *   1. Builds the entity index incrementally from the same scan that
-   *      collects geometry jobs (the old `build_pre_pass_fast` did two
-   *      full-file scans — one for entities, one for the index — which
-   *      doubled wall-clock).
+   *      collects geometry jobs (a separate index scan would double
+   *      wall-clock).
    *   2. As soon as `IFCPROJECT` has been seen, the unit scale and the
    *      first ~50 geometry jobs have been collected, resolves
    *      `unitScale` + `rtcOffset` and emits a `meta` callback so the
@@ -260,19 +252,6 @@ export class IfcAPI {
    */
   constructor();
   /**
-   * Parse IFC file with streaming events
-   * Calls the callback function for each parse event
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * await api.parseStreaming(ifcData, (event) => {
-   *   console.log('Event:', event);
-   * });
-   * ```
-   */
-  parseStreaming(content: string, callback: Function): Promise<any>;
-  /**
    * Fast entity scanning using SIMD-accelerated Rust scanner
    * Returns array of entity references for data model parsing
    * Much faster than TypeScript byte-by-byte scanning (5-10x speedup)
@@ -291,22 +270,6 @@ export class IfcAPI {
    * Much faster than scanning all entities (3x speedup for large files)
    */
   scanGeometryEntitiesFast(content: string): any;
-  /**
-   * Fast scan that only returns metadata-relevant entity refs.
-   * This drastically reduces transfer size for huge-file metadata hydration.
-   */
-  scanRelevantEntitiesFastBytes(data: Uint8Array): any;
-  /**
-   * Parse IFC file (traditional - waits for completion)
-   *
-   * Example:
-   * ```javascript
-   * const api = new IfcAPI();
-   * const result = await api.parse(ifcData);
-   * console.log('Entities:', result.entityCount);
-   * ```
-   */
-  parse(content: string): Promise<any>;
   /**
    * Parse IFC file and extract symbolic representations (Plan,
    * Annotation, FootPrint, Axis). These are 2D curves used for
@@ -342,11 +305,6 @@ export class MeshCollection {
    * Check if RTC offset is significant (>10km)
    */
   hasRtcOffset(): boolean;
-  /**
-   * Convert local coordinates to world coordinates
-   * Use this to convert mesh positions back to original IFC coordinates
-   */
-  localToWorld(x: number, y: number, z: number): Float64Array;
   /**
    * Get mesh at index
    */
@@ -876,7 +834,6 @@ export interface InitOutput {
   readonly gridaxisjs_gridId: (a: number) => number;
   readonly gridaxisjs_start: (a: number) => number;
   readonly gridaxisjs_tag: (a: number, b: number) => void;
-  readonly ifcapi_buildPrePassFast: (a: number, b: number, c: number) => number;
   readonly ifcapi_buildPrePassOnce: (a: number, b: number, c: number) => number;
   readonly ifcapi_buildPrePassStreaming: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
   readonly ifcapi_clearPrePassCache: (a: number) => void;
@@ -884,17 +841,14 @@ export interface InitOutput {
   readonly ifcapi_getMemory: (a: number) => number;
   readonly ifcapi_is_ready: (a: number) => number;
   readonly ifcapi_new: () => number;
-  readonly ifcapi_parse: (a: number, b: number, c: number) => number;
   readonly ifcapi_parseAlignmentLines: (a: number, b: number, c: number) => number;
   readonly ifcapi_parseGridAxes: (a: number, b: number, c: number) => number;
   readonly ifcapi_parseGridLines: (a: number, b: number, c: number) => number;
-  readonly ifcapi_parseStreaming: (a: number, b: number, c: number, d: number) => number;
   readonly ifcapi_parseSymbolicRepresentations: (a: number, b: number, c: number) => number;
   readonly ifcapi_processGeometryBatch: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number) => number;
   readonly ifcapi_scanEntitiesFast: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanEntitiesFastBytes: (a: number, b: number, c: number) => number;
   readonly ifcapi_scanGeometryEntitiesFast: (a: number, b: number, c: number) => number;
-  readonly ifcapi_scanRelevantEntitiesFastBytes: (a: number, b: number, c: number) => number;
   readonly ifcapi_setComputeGeometryHashes: (a: number, b: number, c: number) => void;
   readonly ifcapi_setEntityIndex: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
   readonly ifcapi_setMergeLayers: (a: number, b: number) => void;
@@ -908,7 +862,6 @@ export interface InitOutput {
   readonly meshcollection_get: (a: number, b: number) => number;
   readonly meshcollection_hasRtcOffset: (a: number) => number;
   readonly meshcollection_length: (a: number) => number;
-  readonly meshcollection_localToWorld: (a: number, b: number, c: number, d: number, e: number) => void;
   readonly meshcollection_rtcOffsetX: (a: number) => number;
   readonly meshcollection_rtcOffsetY: (a: number) => number;
   readonly meshcollection_rtcOffsetZ: (a: number) => number;

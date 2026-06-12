@@ -355,15 +355,11 @@ impl IfcAPI {
     pub fn set_tessellation_quality(&self, level: Option<String>) -> Result<(), JsValue> {
         let discriminant = match level.as_deref() {
             None => TESSELLATION_QUALITY_MEDIUM,
-            Some(s) => match s.to_ascii_lowercase().as_str() {
-                "lowest" => 0,
-                "low" => 1,
-                "medium" => TESSELLATION_QUALITY_MEDIUM,
-                "high" => 3,
-                "highest" => 4,
-                other => {
+            Some(s) => match ifc_lite_geometry::TessellationQuality::parse_label(s) {
+                Some(q) => q.to_index(),
+                None => {
                     return Err(JsValue::from_str(&format!(
-                        "Unknown tessellation quality '{other}' — expected \
+                        "Unknown tessellation quality '{s}' — expected \
                          lowest | low | medium | high | highest"
                     )))
                 }
@@ -393,11 +389,7 @@ impl IfcAPI {
             .tessellation_quality
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            0 => TessellationQuality::Lowest,
-            1 => TessellationQuality::Low,
-            3 => TessellationQuality::High,
-            4 => TessellationQuality::Highest,
-            _ => TessellationQuality::Medium,
+            idx => TessellationQuality::from_index(idx),
         }
     }
 
@@ -709,37 +701,7 @@ pub(super) fn drain_and_log_csg_diagnostics(
             std::collections::HashMap::new();
         for fails in csg_failures.values() {
             for f in fails {
-                let key: &'static str = match &f.reason {
-                    ifc_lite_geometry::BoolFailureReason::OperandTooLarge { .. } => {
-                        "OperandTooLarge"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::EmptyOperand => "EmptyOperand",
-                    ifc_lite_geometry::BoolFailureReason::DegenerateOperand => "DegenerateOperand",
-                    ifc_lite_geometry::BoolFailureReason::NoBoundsOverlap => "NoBoundsOverlap",
-                    ifc_lite_geometry::BoolFailureReason::KernelOutputInvalid => {
-                        "KernelOutputInvalid"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::SolidSolidDifferenceSkipped => {
-                        "SolidSolidDifferenceSkipped"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::PolygonalBoundedHalfSpaceFallback => {
-                        "PolygonalBoundedHalfSpaceFallback"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::CutterUnionUnavailable => {
-                        "CutterUnionUnavailable"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::UnknownBooleanOperator(_) => {
-                        "UnknownBooleanOperator"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::ManifoldOutputDegenerate { .. } => {
-                        "ManifoldOutputDegenerate"
-                    }
-                    ifc_lite_geometry::BoolFailureReason::KernelError(_) => "KernelError",
-                    ifc_lite_geometry::BoolFailureReason::DifferenceEmptiedHost => {
-                        "DifferenceEmptiedHost"
-                    }
-                };
-                *by_reason.entry(key).or_insert(0) += 1;
+                *by_reason.entry(f.reason.label()).or_insert(0) += 1;
             }
         }
         let mut breakdown: Vec<(&'static str, usize)> = by_reason.into_iter().collect();
