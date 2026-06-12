@@ -530,6 +530,7 @@ fn is_quick_spatial_type_ci(type_name: &str) -> bool {
         || type_name.eq_ignore_ascii_case("IFCBUILDING")
         || type_name.eq_ignore_ascii_case("IFCBUILDINGSTOREY")
         || type_name.eq_ignore_ascii_case("IFCSPACE")
+        || type_name.eq_ignore_ascii_case("IFCSPATIALZONE")
         || type_name.eq_ignore_ascii_case("IFCFACILITY")
         || type_name.eq_ignore_ascii_case("IFCFACILITYPART")
         || type_name.eq_ignore_ascii_case("IFCBRIDGE")
@@ -883,6 +884,15 @@ pub fn process_geometry_streaming_filtered_with_options(
     } else {
         Vec::new()
     };
+    // IfcRelReferencedInSpatialStructure is a *secondary* (non-owning) link — a
+    // space referenced from another storey for context. It must NOT establish
+    // primary tree ownership, so it is kept separate from containment links and
+    // only ever contributes elements, never parent/child node ownership (#1075).
+    let mut quick_referenced_links = if quick_metadata_enabled {
+        Vec::<(u32, Vec<u32>)>::new()
+    } else {
+        Vec::new()
+    };
     let mut quick_element_summaries = if quick_metadata_enabled {
         HashMap::<u32, QuickMetadataEntitySummary>::new()
     } else {
@@ -927,12 +937,20 @@ pub fn process_geometry_streaming_filtered_with_options(
                             .unwrap_or_default(),
                     ));
                 }
-            } else if type_name.eq_ignore_ascii_case("IFCRELCONTAINEDINSPATIALSTRUCTURE")
-                || type_name.eq_ignore_ascii_case("IFCRELREFERENCEDINSPATIALSTRUCTURE")
-            {
+            } else if type_name.eq_ignore_ascii_case("IFCRELCONTAINEDINSPATIALSTRUCTURE") {
                 let args = parse_step_arguments(&content[start..end]);
                 if let Some(parent_id) = args.get(5).and_then(|token| parse_step_ref(token)) {
                     quick_containment_links.push((
+                        parent_id,
+                        args.get(4)
+                            .map(|token| parse_step_ref_list(token))
+                            .unwrap_or_default(),
+                    ));
+                }
+            } else if type_name.eq_ignore_ascii_case("IFCRELREFERENCEDINSPATIALSTRUCTURE") {
+                let args = parse_step_arguments(&content[start..end]);
+                if let Some(parent_id) = args.get(5).and_then(|token| parse_step_ref(token)) {
+                    quick_referenced_links.push((
                         parent_id,
                         args.get(4)
                             .map(|token| parse_step_ref_list(token))
@@ -1213,8 +1231,51 @@ pub fn process_geometry_streaming_filtered_with_options(
             }
         }
         for (parent_id, element_ids) in quick_containment_links {
-            if let Some(parent) = spatial_nodes.get_mut(&parent_id) {
-                parent.elements.extend(element_ids);
+            if !spatial_nodes.contains_key(&parent_id) {
+                continue;
+            }
+            for child_id in element_ids {
+                // A spatial element (IfcSpace / IfcSpatialZone) attached to a
+                // storey via IfcRelContainedInSpatialStructure — what Revit
+                // Family + Dynamo emits instead of IfcRelAggregates — is a real
+                // node of the spatial tree, not a contained product. Promote it
+                // to a child node so it shows in the hierarchy (#1075); anything
+                // that isn't itself a spatial node stays a contained element.
+                if spatial_nodes.contains_key(&child_id) {
+                    // Skip if already placed via IfcRelAggregates (wired just
+                    // above) to avoid a duplicate child / parent overwrite.
+                    let already_placed = spatial_nodes
+                        .get(&child_id)
+                        .is_some_and(|child| child.parent.is_some());
+                    if !already_placed {
+                        if let Some(parent) = spatial_nodes.get_mut(&parent_id) {
+                            parent.children.push(child_id);
+                        }
+                        if let Some(child) = spatial_nodes.get_mut(&child_id) {
+                            child.parent = Some(parent_id);
+                        }
+                    }
+                } else if let Some(parent) = spatial_nodes.get_mut(&parent_id) {
+                    parent.elements.push(child_id);
+                }
+            }
+        }
+        // Referenced-in links are non-owning: they only contribute elements and
+        // never promote to (or re-parent) a spatial node, so a space referenced
+        // from a second storey can't steal ownership from its containing storey.
+        for (parent_id, element_ids) in quick_referenced_links {
+            if !spatial_nodes.contains_key(&parent_id) {
+                continue;
+            }
+            for child_id in element_ids {
+                // A child that is itself a spatial node keeps the ownership it
+                // got from its IfcRelContainedInSpatialStructure/aggregate link.
+                if spatial_nodes.contains_key(&child_id) {
+                    continue;
+                }
+                if let Some(parent) = spatial_nodes.get_mut(&parent_id) {
+                    parent.elements.push(child_id);
+                }
             }
         }
         let mut root_id = spatial_nodes

@@ -254,6 +254,18 @@ function extractAutoColorValue(
       if (!provider.getModelId) return undefined;
       return provider.getModelId(globalId);
 
+    case 'group': {
+      if (!provider.getEntityGroups) return undefined;
+      const groups = provider.getEntityGroups(globalId);
+      if (!groups || groups.length === 0) return undefined;
+      // Prefer an IfcZone membership so multi-group entities (IfcZone +
+      // IfcGroup/IfcSystem) bucket by zone deterministically, not by whichever
+      // relation happened to come first. Use the name when present, else
+      // "Type #id" so unnamed groups still bucket distinctly.
+      const g = groups.find((x) => x.type === 'IfcZone') ?? groups[0];
+      return g.name && g.name.trim() !== '' ? g.name : `${g.type} #${g.id}`;
+    }
+
     default:
       return undefined;
   }
