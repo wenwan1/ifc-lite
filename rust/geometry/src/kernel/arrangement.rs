@@ -63,6 +63,14 @@ pub struct Arrangement {
     pub coplanar_a: Vec<bool>,
     /// Per-sub-triangle (parallel to `tris_b`) coplanar-parent flag.
     pub coplanar_b: Vec<bool>,
+    /// Lazy per-Vid materialized f64 point cache. Classification
+    /// (`centroid`/`tri_normal` per sub-triangle) and the final output map all
+    /// call `to_f64_pt` on the SAME heavily-shared conforming vertices many times;
+    /// materialising the interned point (fixed-width lambda, or the BigRational
+    /// fallback) is not free, so each Vid is computed once and reused. The cached
+    /// value equals a fresh computation exactly, so the boolean output is
+    /// unchanged. Indexed by `Vid`; `None` = not yet materialised.
+    f64_cache: std::cell::RefCell<Vec<Option<[f64; 3]>>>,
 }
 
 /// A raw intersection segment on a triangle, tagged with the cutter triangle that
@@ -78,13 +86,29 @@ fn tri_plane(t: &Tri) -> [[f64; 3]; 3] {
     *t
 }
 
+/// A segment endpoint paired with its CACHED interval lambda, so `orient2d` can run
+/// the f64-interval determinant straight from the lambda (the >95%-resolving fast
+/// tier) without re-deriving the degree-4/7 LPI/TPI lambda on every call. The raw
+/// `ImplicitPoint` is kept only for the exact-tier fallback on an interval straddle.
+type EndLam<'a> = (&'a super::interval::IvLam, &'a ImplicitPoint);
+
+/// 2-D orientation from cached interval lambdas, falling to the full exact cascade
+/// (`orient2d_any`) only when the interval determinant straddles zero. Either way
+/// the returned sign is the EXACT sign, so callers are byte-identical to recomputing.
+#[inline]
+fn orient2d_end(a: EndLam, b: EndLam, c: EndLam, axis: super::DropAxis) -> Sign {
+    super::interval::orient2d_from_lam_iv(a.0, b.0, c.0, axis)
+        .unwrap_or_else(|| orient2d_any(a.1, b.1, c.1, axis))
+}
+
 /// Do segments `(a1,b1)` and `(a2,b2)` (in `T`'s plane, projected by `axis`)
-/// properly cross at an interior point? (Shared endpoints don't count.)
-fn segments_cross(a1: &ImplicitPoint, b1: &ImplicitPoint, a2: &ImplicitPoint, b2: &ImplicitPoint, axis: super::DropAxis) -> bool {
-    let s1 = orient2d_any(a1, b1, a2, axis);
-    let s2 = orient2d_any(a1, b1, b2, axis);
-    let s3 = orient2d_any(a2, b2, a1, axis);
-    let s4 = orient2d_any(a2, b2, b1, axis);
+/// properly cross at an interior point? (Shared endpoints don't count.) Lambda-
+/// cached variant of the classic four-orientation test.
+fn segments_cross(a1: EndLam, b1: EndLam, a2: EndLam, b2: EndLam, axis: super::DropAxis) -> bool {
+    let s1 = orient2d_end(a1, b1, a2, axis);
+    let s2 = orient2d_end(a1, b1, b2, axis);
+    let s3 = orient2d_end(a2, b2, a1, axis);
+    let s4 = orient2d_end(a2, b2, b1, axis);
     s1 != Sign::Zero && s2 != Sign::Zero && s1 != s2 && s3 != Sign::Zero && s4 != Sign::Zero && s3 != s4
 }
 
@@ -99,10 +123,20 @@ fn split_crossings(t: &Tri, raws: &[RawSeg]) -> Vec<Constraint> {
         None => return Vec::new(),
     };
     let n = raws.len();
+    // Cache each endpoint's interval lambda ONCE (Attene "Indirect Predicates" §5.4):
+    // the O(n²) crossing loop reuses every endpoint across many `orient2d` calls and
+    // would otherwise re-derive its degree-4/7 LPI/TPI lambda on each. Byte-identical
+    // — the cached lambda equals a fresh one and the exact tiers are unchanged.
+    let iv: Vec<(super::interval::IvLam, super::interval::IvLam)> = raws
+        .iter()
+        .map(|r| (super::interval::ilambda_cached(&r.a), super::interval::ilambda_cached(&r.b)))
+        .collect();
     let mut splits: Vec<Vec<ImplicitPoint>> = vec![Vec::new(); n];
     for k in 0..n {
+        let (ka, kb) = ((&iv[k].0, &raws[k].a), (&iv[k].1, &raws[k].b));
         for l in (k + 1)..n {
-            if segments_cross(&raws[k].a, &raws[k].b, &raws[l].a, &raws[l].b, axis) {
+            let (la, lb) = ((&iv[l].0, &raws[l].a), (&iv[l].1, &raws[l].b));
+            if segments_cross(ka, kb, la, lb, axis) {
                 let x = ImplicitPoint::Tpi(Tpi {
                     planes: [tri_plane(t), tri_plane(&raws[k].cutter), tri_plane(&raws[l].cutter)],
                 });
@@ -195,7 +229,16 @@ pub fn arrange(a: &[Tri], b: &[Tri]) -> Arrangement {
         retriangulate_each(a, &ca, &pt_a, &cop_parent_a, &mut interner, &mut unrecovered);
     let (tris_b, coplanar_b) =
         retriangulate_each(b, &cb, &pt_b, &cop_parent_b, &mut interner, &mut unrecovered);
-    Arrangement { interner, tris_a, tris_b, coplanar_a, coplanar_b, unrecovered }
+    let n_pts = interner.len();
+    Arrangement {
+        interner,
+        tris_a,
+        tris_b,
+        coplanar_a,
+        coplanar_b,
+        unrecovered,
+        f64_cache: std::cell::RefCell::new(vec![None; n_pts]),
+    }
 }
 
 /// The conforming arrangement of `n` operand meshes over one shared interner.
@@ -512,15 +555,57 @@ fn point_inside(p: [f64; 3], tris: &[Tri], far_l: f64) -> bool {
     tris.iter().filter(|t| exact_seg_hits_tri(p, far, t)).count() % 2 == 1
 }
 
+/// BVH-accelerated [`point_inside`]: the `bvh` (built over `tris`) prunes the ray
+/// to the triangles whose AABB it may cross, and the EXACT crossing test runs only
+/// on those. The BVH candidate set is a conservative superset of the exact hits,
+/// so the crossing-parity — hence the inside/outside verdict — is byte-identical
+/// to the linear scan (the pinned boolean determinism manifests are unperturbed).
+/// O(N) → O(log N + hits) per query, the win on host operands with many triangles.
+fn point_inside_bvh(
+    p: [f64; 3],
+    tris: &[Tri],
+    bvh: &super::broadphase::Bvh,
+    far_l: f64,
+    scratch: &mut Vec<u32>,
+) -> bool {
+    let dir = ray_dir();
+    let far = [p[0] + dir[0] * far_l, p[1] + dir[1] * far_l, p[2] + dir[2] * far_l];
+    scratch.clear();
+    bvh.ray_candidates(p, far, scratch);
+    scratch
+        .iter()
+        .filter(|&&i| exact_seg_hits_tri(p, far, &tris[i as usize]))
+        .count()
+        % 2
+        == 1
+}
+
 fn to_f64_pt(arr: &Arrangement, v: Vid) -> [f64; 3] {
-    let pt = arr.interner.get(v);
-    // Fast path: materialize via the fixed-width lambda. Falls back to the exact
-    // BigRational `point_of` only for off-grid/overflow points (rare).
-    if let Some(f) = super::fixed::point_to_f64(pt) {
-        return f;
+    let idx = v as usize;
+    if let Some(slot) = arr.f64_cache.borrow().get(idx).copied() {
+        if let Some(p) = slot {
+            return p;
+        }
     }
-    let p = point_of(pt);
-    [p[0].to_f64().unwrap(), p[1].to_f64().unwrap(), p[2].to_f64().unwrap()]
+    let pt = arr.interner.get(v);
+    // Reuse the interner's already-cached I512 lambda (computed once at intern time)
+    // rather than re-deriving it at I1024 in `point_to_f64`; fall to the from-scratch
+    // fixed-width path on a cache miss (overflow), then to exact BigRational `point_of`
+    // for off-grid points. All three yield the identical f64.
+    let p = arr
+        .interner
+        .lam(v)
+        .as_ref()
+        .and_then(super::fixed::point_to_f64_from_lam)
+        .or_else(|| super::fixed::point_to_f64(pt))
+        .unwrap_or_else(|| {
+            let q = point_of(pt);
+            [q[0].to_f64().unwrap(), q[1].to_f64().unwrap(), q[2].to_f64().unwrap()]
+        });
+    if let Some(slot) = arr.f64_cache.borrow_mut().get_mut(idx) {
+        *slot = Some(p);
+    }
+    p
 }
 
 fn sub_f64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -555,23 +640,51 @@ fn drop_axis_of(n: [f64; 3]) -> DropAxis {
 /// If point `c` lies exactly on a triangle of `others` (coplanar AND inside it),
 /// return that triangle's f64 normal — i.e. detect that a sub-triangle whose
 /// centroid is `c` sits on a coplanar SHARED face of the other operand.
-fn on_surface_normal(c: [f64; 3], others: &[Tri]) -> Option<[f64; 3]> {
-    for t in others {
-        if orient3d(&e(t[0]), &e(t[1]), &e(t[2]), &e(c)) != Sign::Zero {
-            continue; // c not on t's plane
-        }
-        let n = cross3(sub_f64(t[1], t[0]), sub_f64(t[2], t[0]));
-        let axis = drop_axis_of(n);
-        let w0 = orient2d_any(&e(t[0]), &e(t[1]), &e(t[2]), axis);
-        if w0 == Sign::Zero {
-            continue; // degenerate t
-        }
-        let inside = |u: [f64; 3], v: [f64; 3]| orient2d_any(&e(u), &e(v), &e(c), axis) != w0.flip();
-        if inside(t[0], t[1]) && inside(t[1], t[2]) && inside(t[2], t[0]) {
-            return Some(n);
-        }
+/// Exact in-plane containment: with `n` the un-normalised face normal of `t`, is
+/// `c` strictly inside `t`'s outline projected onto the dropped axis? Shared by the
+/// exact and near coplanar-surface tests; false for a degenerate projected `t`.
+fn point_in_tri_proj(c: [f64; 3], t: &Tri, n: [f64; 3]) -> bool {
+    let axis = drop_axis_of(n);
+    let w0 = orient2d_any(&e(t[0]), &e(t[1]), &e(t[2]), axis);
+    if w0 == Sign::Zero {
+        return false; // degenerate t in projection
     }
-    None
+    let inside = |u: [f64; 3], v: [f64; 3]| orient2d_any(&e(u), &e(v), &e(c), axis) != w0.flip();
+    inside(t[0], t[1]) && inside(t[1], t[2]) && inside(t[2], t[0])
+}
+
+/// Per-triangle exact coincident-face test (see [`on_surface_normal`]).
+fn on_surface_tri(c: [f64; 3], t: &Tri) -> Option<[f64; 3]> {
+    if orient3d(&e(t[0]), &e(t[1]), &e(t[2]), &e(c)) != Sign::Zero {
+        return None; // c not on t's plane
+    }
+    let n = cross3(sub_f64(t[1], t[0]), sub_f64(t[2], t[0]));
+    point_in_tri_proj(c, t, n).then_some(n)
+}
+
+/// Per-triangle near-coplanar-flush test (see [`near_on_surface_normal`]); `band2`
+/// is the squared perpendicular plane-gap tolerance.
+fn near_on_surface_tri(c: [f64; 3], t: &Tri, band2: f64) -> Option<[f64; 3]> {
+    let n = cross3(sub_f64(t[1], t[0]), sub_f64(t[2], t[0]));
+    let nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+    if nn <= 0.0 || !nn.is_finite() {
+        return None; // degenerate t
+    }
+    let d = dot3(sub_f64(c, t[0]), n);
+    if (d * d) / nn > band2 {
+        return None; // c not within the snap band of t's plane
+    }
+    point_in_tri_proj(c, t, n).then_some(n)
+}
+
+/// The near-coplanar perpendicular band (see [`near_on_surface_normal`]) from the
+/// operand+`c` coordinate magnitude `extent`.
+fn near_band_from_extent(extent: f64) -> f64 {
+    (8.0 * SNAP_GRID).max(extent * (1.0 / 4_194_304.0))
+}
+
+fn on_surface_normal(c: [f64; 3], others: &[Tri]) -> Option<[f64; 3]> {
+    others.iter().find_map(|t| on_surface_tri(c, t))
 }
 
 /// Power-of-two grid `mesh_bridge` snaps both operands to (metres); the
@@ -616,33 +729,33 @@ fn near_on_surface_normal(c: [f64; 3], others: &[Tri]) -> Option<[f64; 3]> {
             }
         }
     }
-    // band: max perpendicular plane-gap a flush f32 face leaves after the 2-operand
-    // snap, widened for far-from-origin coords (8·SNAP_GRID ≈ 0.12 mm; the
-    // extent·2^-22 term only dominates past ~32 km from origin).
-    let band = (8.0 * SNAP_GRID).max(extent * (1.0 / 4_194_304.0));
+    let band2 = near_band_from_extent(extent).powi(2);
+    others.iter().find_map(|t| near_on_surface_tri(c, t, band2))
+}
+
+/// BVH-accelerated equivalent of `on_surface_normal(c, a).is_some() ||
+/// near_on_surface_normal(c, a).is_some()` — does ANY triangle of `a` carry `c` on
+/// its face (exactly or within the snap band)? `a_coord_extent` is the max |coord|
+/// over `a` (hoisted once per arrangement, since only `c` varies per call). The
+/// query radius is the band, so candidates are a conservative superset and the
+/// exact per-triangle predicates decide; the result is `any`, so it is independent
+/// of candidate order and byte-identical to the linear scan.
+fn c_on_or_near_a(
+    c: [f64; 3],
+    a: &[Tri],
+    bvh: &super::broadphase::Bvh,
+    a_coord_extent: f64,
+    scratch: &mut Vec<u32>,
+) -> bool {
+    let extent = c.iter().fold(a_coord_extent, |m, &x| m.max(x.abs()));
+    let band = near_band_from_extent(extent);
     let band2 = band * band;
-    for t in others {
-        let n = cross3(sub_f64(t[1], t[0]), sub_f64(t[2], t[0]));
-        let nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
-        if nn <= 0.0 || !nn.is_finite() {
-            continue; // degenerate t
-        }
-        // squared perpendicular distance of `c` to t's plane = (d·n)² / |n|²
-        let d = dot3(sub_f64(c, t[0]), n);
-        if (d * d) / nn > band2 {
-            continue; // c not within the snap band of t's plane
-        }
-        let axis = drop_axis_of(n);
-        let w0 = orient2d_any(&e(t[0]), &e(t[1]), &e(t[2]), axis);
-        if w0 == Sign::Zero {
-            continue; // degenerate t in projection
-        }
-        let inside = |u: [f64; 3], v: [f64; 3]| orient2d_any(&e(u), &e(v), &e(c), axis) != w0.flip();
-        if inside(t[0], t[1]) && inside(t[1], t[2]) && inside(t[2], t[0]) {
-            return Some(n);
-        }
-    }
-    None
+    scratch.clear();
+    bvh.point_candidates(c, band, scratch);
+    scratch.iter().any(|&i| {
+        let t = &a[i as usize];
+        on_surface_tri(c, t).is_some() || near_on_surface_tri(c, t, band2).is_some()
+    })
 }
 
 /// Is the OTHER operand's solid present just off `c` along `±dir`?
@@ -899,6 +1012,16 @@ fn boolean_vids_components(
 ) -> Vec<[Vid; 3]> {
     use std::collections::HashSet;
     let ext_a = operand_extent(a);
+    // One BVH over operand A, reused for every B-face inside/outside ray-cast AND
+    // coincident/near-surface probe below (the dominant O(|tris_b|·|a|) scans on
+    // boolean-heavy meshes). `a_coord_extent` (hoisted) feeds the near-surface band.
+    let bvh_a = super::broadphase::Bvh::build(a);
+    let a_coord_extent = a
+        .iter()
+        .flat_map(|t| t.iter())
+        .flat_map(|v| v.iter())
+        .fold(1.0f64, |m, &x| m.max(x.abs()));
+    let mut scratch: Vec<u32> = Vec::new();
     let dedup = matches!(op, BoolOp::Union | BoolOp::Intersection);
     let mut a_kept: HashSet<[Vid; 3]> = HashSet::new();
     let mut out = Vec::new();
@@ -966,7 +1089,7 @@ fn boolean_vids_components(
         // own (the host imposes none on it) so `coplanar_b` is unset for it, yet it
         // is still a coincident shared face that must drop (the #1007 flush roof cap
         // — without the near drop here it survives and bridges the opening).
-        if on_surface_normal(c, a).is_some() || near_on_surface_normal(c, a).is_some() {
+        if c_on_or_near_a(c, a, &bvh_a, a_coord_extent, &mut scratch) {
             continue; // coplanar-shared B-copy: dropped (the A-copy is the kept one)
         }
         if cop_parent {
@@ -979,7 +1102,7 @@ fn boolean_vids_components(
                 continue;
             }
         }
-        let inside_a = point_inside(c, a, ext_a);
+        let inside_a = point_inside_bvh(c, a, &bvh_a, ext_a, &mut scratch);
         let (keep, flip) = match op {
             BoolOp::Difference => (inside_a, true),
             BoolOp::Union => (!inside_a, false),
