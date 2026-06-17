@@ -62,6 +62,9 @@
   --tab-text: #71717a;
   --tab-active-bg: #ffffff;
   --tab-active-text: #18181b;
+  /* Slightly-raised inactive tab (properties strip). Light mode lifts toward
+     white; dark mode overrides this to skip the lift (see below). */
+  --tab-inactive-bg: color-mix(in srgb, var(--tabs-bg) 82%, white 18%);
 }
 
 .dark {
@@ -74,9 +77,16 @@
   /* Tabs - Dark mode */
   --tabs-bg: #1f2335;
   --tabs-border: #3b4261;
-  --tab-text: #565f89;
+  /* #565f89 (tokyo comment) was only 2.51:1 on --tabs-bg — below WCAG AA.
+     #828bb8 keeps the Tokyo Night hue at 4.69:1 (issue #1107, item 1). */
+  --tab-text: #828bb8;
   --tab-active-bg: #16161e;
   --tab-active-text: #a9b1d6;
+  /* No white-lift on the inactive trigger in dark mode: even an 18% lift takes
+     the bg to ~#474b59 where --tab-text (#828bb8) drops to 2.6:1. Keep it flat
+     on --tabs-bg so the muted label stays at 4.69:1 AA; the active tab is still
+     distinct via its darker bg + accent border (issue #1107, item 1 review). */
+  --tab-inactive-bg: var(--tabs-bg);
 }
 
 /* Custom theme configuration */
@@ -121,7 +131,11 @@
   --color-secondary: var(--tokyo-bg-highlight);
   --color-secondary-foreground: var(--tokyo-fg);
   --color-muted: var(--tokyo-bg-highlight);
-  --color-muted-foreground: var(--tokyo-comment);
+  /* --tokyo-comment (#565f89) is ~2.5-2.9:1 on the dark surfaces this maps
+     onto (storm/night/highlight) — below WCAG AA. #828bb8 holds the Tokyo
+     Night hue at >=4.69:1. Kept separate from --tokyo-comment so the latter
+     stays usable for decorative fills (issue #1107, item 1). */
+  --color-muted-foreground: #828bb8;
   --color-accent: var(--tokyo-bg-highlight);
   --color-accent-foreground: var(--tokyo-fg);
   --color-destructive: var(--tokyo-red);
@@ -190,7 +204,10 @@ body {
 .dark .text-zinc-500,
 .dark .text-zinc-400,
 .dark .text-zinc-600 {
-  color: var(--tokyo-comment) !important;
+  /* Route muted utility text through the accessible muted-foreground token
+     (#828bb8) instead of raw --tokyo-comment (#565f89, ~2.5:1, fails WCAG AA).
+     issue #1107, item 1. */
+  color: var(--color-muted-foreground) !important;
 }
 
 .dark .text-zinc-200,
@@ -345,7 +362,7 @@ body {
   border-bottom: 0;
   border-left: 0;
   border-radius: 0 !important;
-  background-color: color-mix(in srgb, var(--tabs-bg) 82%, white 18%) !important;
+  background-color: var(--tab-inactive-bg) !important;
   color: var(--tab-text) !important;
   font-weight: 600;
   line-height: 1;
