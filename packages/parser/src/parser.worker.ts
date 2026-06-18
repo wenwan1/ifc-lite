@@ -16,6 +16,7 @@
  */
 
 import init, { IfcAPI } from '@ifc-lite/wasm';
+import { initWasmWithRetry } from './wasm-init-retry.js';
 import { IfcParser } from './index.js';
 import type { IfcDataStore } from './columnar-parser.js';
 import type { WasmScanApi } from './entity-scanner.js';
@@ -127,7 +128,16 @@ let initPromise: Promise<void> | null = null;
 
 async function ensureWasmScanApi(): Promise<Pick<WasmScanApi, 'scanEntitiesFastBytes'>> {
   if (cachedFullScanApi) return cachedFullScanApi;
-  if (!initPromise) initPromise = init().then(() => {});
+  // `init` is wrapped in `initWasmWithRetry` so a transient engine-binary
+  // download failure is retried once before failing. Clear `initPromise` on
+  // failure so a later call can recover (e.g. the network came back) instead
+  // of memoising the rejection forever.
+  if (!initPromise) {
+    initPromise = initWasmWithRetry(() => init(), { label: 'parser.worker' }).catch((err) => {
+      initPromise = null;
+      throw err;
+    });
+  }
   await initPromise;
   const api = new IfcAPI();
   cachedFullScanApi = {

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import init, { initSync, IfcAPI } from '@ifc-lite/wasm';
+import { initWasmWithRetry } from './wasm-init-retry.js';
 import type { MeshData, TessellationQuality } from './types.js';
 import {
   DEFAULT_BATCH_SIZING,
@@ -239,10 +240,15 @@ let cachedWasmUrl: string | undefined = undefined;
  * explicit-URL plumbing only has to set state in one place. Returns the
  * `IfcAPI` so call sites can use the value directly without a non-null
  * assertion on the module-level `api`.
+ *
+ * `init` is wrapped in {@link initWasmWithRetry} so a transient engine-binary
+ * download failure (a cold CDN edge, mid-deploy race, or flaky proxy) is
+ * retried once before failing. `__wbg_init` only short-circuits on
+ * `wasm !== undefined`, so a retry after a failed load safely re-fetches.
  */
 async function ensureInit(): Promise<IfcAPI> {
   if (api) return api;
-  await init(cachedWasmUrl);
+  await initWasmWithRetry(() => init(cachedWasmUrl), { label: 'geometry.worker' });
   api = new IfcAPI();
   mergeLayersApplied = false;
   applyMergeLayersToApi();
