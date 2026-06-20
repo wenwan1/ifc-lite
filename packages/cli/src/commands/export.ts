@@ -11,6 +11,7 @@
  */
 
 import { writeFile } from 'node:fs/promises';
+import { basename } from 'node:path';
 import { createHeadlessContext } from '../loader.js';
 import { getFlag, hasFlag, fatal, writeOutput } from '../output.js';
 import type { ComparisonOp } from '@ifc-lite/sdk';
@@ -144,7 +145,7 @@ export async function exportCommand(args: string[]): Promise<void> {
   const propFilter = getFlag(args, '--where');
   const storeyFilter = getFlag(args, '--storey');
 
-  if (!filePath) fatal('Usage: ifc-lite export <file.ifc> --format csv|json|ifc [--type IfcWall] [--columns Name,Type,GlobalId] [--where PsetName.Prop=Value] [--storey Name] [--out file]');
+  if (!filePath) fatal('Usage: ifc-lite export <file.ifc> --format csv|json|ifc|hbjson [--type IfcWall] [--columns Name,Type,GlobalId] [--where PsetName.Prop=Value] [--storey Name] [--name Model] [--out file]');
 
   // B9/F6: Auto-prefix Ifc
   if (type) {
@@ -241,7 +242,15 @@ export async function exportCommand(args: string[]): Promise<void> {
       process.stderr.write(`Written to ${outPath}\n`);
       break;
     }
+    case 'hbjson': {
+      // Honeybee/Ladybug energy-model export via the SDK (the headless backend meshes
+      // analytically through the wasm engine; the data-only SDK delegates to it).
+      const name = getFlag(args, '--name') ?? basename(filePath).replace(/\.ifc$/i, '');
+      const hbjson = await bim.export.hbjson({ name });
+      await writeOutput(hbjson, outPath);
+      break;
+    }
     default:
-      fatal(`Unknown format: ${format}. Supported: csv, json, ifc`);
+      fatal(`Unknown format: ${format}. Supported: csv, json, ifc, hbjson`);
   }
 }

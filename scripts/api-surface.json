@@ -3425,6 +3425,7 @@
     "ExportBackendMethods: interface",
     "ExportCsvOptions: interface",
     "ExportGltfOptions: interface",
+    "ExportHbjsonOptions: interface",
     "ExportNamespace: class",
     "ExportStepOptions: interface",
     "FileAttachmentInfo: interface",
