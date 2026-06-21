@@ -32,6 +32,47 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 // itself so its overlay-path logic stays unit-testable.
 import './lib/placement-edit.boot';
 
+// Post-mount chunk recovery — complements the inline boot self-heal in
+// index.html. The boot watchdog handles the ENTRY failing to load; this handles
+// a LAZY chunk (exporters / ids / bcf / sandbox …) 404ing after a newer deploy
+// ships fresh hashes mid-session. Vite dispatches `vite:preloadError` for that;
+// reload once (sessionStorage-bounded) to pull the matching new chunks.
+window.addEventListener('vite:preloadError', (event) => {
+  const KEY = 'ifc-lite:chunk-reload';
+  // Bound the retry with sessionStorage. If storage is unavailable (private mode
+  // / sandboxed frame) we can't record the attempt, so we must NOT reload — that
+  // would loop forever on a permanently-missing chunk. In that case fall through
+  // and let Vite surface the error.
+  let attempt = 0;
+  try {
+    attempt = Number(sessionStorage.getItem(KEY)) || 0;
+  } catch (err) {
+    console.warn('[chunk-reload] sessionStorage unreadable; letting preload error surface', err);
+    return;
+  }
+  if (attempt >= 1) return; // already retried this session — let the error surface
+  let recorded = false;
+  try {
+    sessionStorage.setItem(KEY, String(attempt + 1));
+    recorded = (Number(sessionStorage.getItem(KEY)) || 0) > attempt;
+  } catch (err) {
+    console.warn('[chunk-reload] sessionStorage unwritable; letting preload error surface', err);
+  }
+  if (!recorded) return; // couldn't bound the retry → don't suppress Vite's error or loop
+  // Stop Vite from re-throwing as an unhandled rejection; we own the recovery.
+  event.preventDefault();
+  window.location.reload();
+});
+
+// Reaching here means the entry executed and is about to mount, so any prior
+// boot/chunk reload succeeded — reset the chunk guard for a fresh budget.
+try {
+  sessionStorage.removeItem('ifc-lite:chunk-reload');
+} catch (err) {
+  // Storage unavailable — nothing was persisted to clear; log per the no-silent-catch rule.
+  console.warn('[chunk-reload] could not clear retry guard', err);
+}
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />
