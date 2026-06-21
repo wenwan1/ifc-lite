@@ -199,6 +199,25 @@ export interface RenderOptions {
    * — keep them out of the map to avoid unnecessary work.
    */
   transparencyOverrides?: Map<number, number> | null;
+  /**
+   * X-Ray *context* mode: every non-selected mesh whose `expressId` is NOT in
+   * this set renders at {@link ghostAlpha}, so a focused subset (e.g. a clash
+   * pair) stays solid while the rest of the model fades to translucent context.
+   *
+   * `null`/absent disables ghosting. Selected meshes (`selectedId`/`selectedIds`)
+   * are always exempt, and explicit {@link transparencyOverrides} entries win
+   * over the ghost alpha. Same id space as `isolatedIds` (federated global id).
+   *
+   * Mixed colour batches resolve to the minimum alpha among their non-selected
+   * entities (same as {@link transparencyOverrides}), so an excepted id that
+   * shares a batch with ghosted ids fades with the batch unless it is also in
+   * `selectedIds` — the selection highlight pass then repaints it opaque. To
+   * guarantee a focused entity stays fully solid, include it in `selectedIds`
+   * (the clash viewer co-selects the focused pair for exactly this reason).
+   */
+  ghostExceptIds?: Set<number> | null;
+  /** Alpha (0..1) for ghosted meshes under {@link ghostExceptIds}. Default 0.12. */
+  ghostAlpha?: number;
   // Building rotation in radians (from IfcSite placement) - used to orient section planes
   buildingRotation?: number;
   selectedModelIndex?: number;    // Model index for multi-model selection (must match mesh.modelIndex)
