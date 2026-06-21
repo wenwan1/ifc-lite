@@ -853,10 +853,17 @@ impl GeometryRouter {
 
         let mesh = self.process_representation_item_uncached(item, decoder)?;
 
-        // Cache the freshly-meshed item under its structural hash. Empty meshes
-        // (unsupported/degenerate geometry) are never cached.
+        // Cache the freshly-meshed item under its structural hash. Two exclusions:
+        //  - empty meshes (unsupported/degenerate geometry);
+        //  - results produced once the per-element CSG budget has tripped. On a
+        //    trip the boolean bails and `subtract_mesh` returns the UNCUT host
+        //    (records `OperandTooLarge`); since the dedup key is budget-independent
+        //    (structure/quality/scale/RTC), caching that fallback would serve the
+        //    wrong (uncut) mesh to later identical booleans in a fresh-budget
+        //    element (`budget::begin_element()` resets per element). Correctness of
+        //    the cut wins over deduping a degraded result. (#1257 review P1.)
         if let (Some(key), Some(cache)) = (dedup_key, self.item_dedup_cache.as_ref()) {
-            if !mesh.positions.is_empty() {
+            if !mesh.positions.is_empty() && !crate::kernel::budget::tripped() {
                 cache
                     .lock()
                     .expect("dedup cache poisoned")
@@ -875,13 +882,25 @@ impl GeometryRouter {
     /// must distinguish them (#976).
     fn item_dedup_key(&self, item: &DecodedEntity, decoder: &mut EntityDecoder) -> Option<u128> {
         self.item_dedup_cache.as_ref()?;
-        // Only dedup types with a CHEAP structural hash. `item_signature` walks
-        // IfcFacetedBrep through the cached byte fast paths (no decode_by_id per
-        // point); every other type still falls back to the slow recursive decode,
-        // where the hash costs more than the meshing it skips (#1177). Gating here
-        // keeps dedup a net win on brep-heavy (Tekla steel) models without
-        // regressing the procedural-geometry models that motivated turning it off.
-        if !matches!(item.ifc_type, IfcType::IfcFacetedBrep) {
+        // Dedup the geometry types whose repeated instances dominate real models:
+        // IfcFacetedBrep (tessellated steel) AND the procedural boolean/extrusion
+        // hot path (clipped beams/columns — IfcBooleanResult /
+        // IfcBooleanClippingResult / IfcExtrudedAreaSolid). #1177 had restricted
+        // this to IfcFacetedBrep because the structural hash re-decoded the subtree
+        // per item; it is now memoized (`content_sig_memo`), so shared subtrees
+        // (the same cutter/profile referenced by hundreds of parts) are hashed once
+        // and the dedup is a measured net win, byte-identical: a 20 MB boolean-clip
+        // steel model (170_KM) drops geometry 16.4 s → 2.8 s (5.8×), and procedural
+        // arch models improve too (advanced_model 3.1×, ISSUE_068 1.7×) with no
+        // regression on the tested corpus. The IfcMappedItem instancing cache is a
+        // separate path, always on.
+        if !matches!(
+            item.ifc_type,
+            IfcType::IfcFacetedBrep
+                | IfcType::IfcBooleanResult
+                | IfcType::IfcBooleanClippingResult
+                | IfcType::IfcExtrudedAreaSolid
+        ) {
             return None;
         }
         let structural = {
