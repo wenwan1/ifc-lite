@@ -177,6 +177,9 @@ export class Renderer {
     private canvas: HTMLCanvasElement;
     private sectionPlaneRenderer: SectionPlaneRenderer | null = null;
     private section2DOverlayRenderer: Section2DOverlayRenderer | null = null;
+    // Overlay/section-cut line colour, kept on the Renderer so it survives a
+    // pre-init call and a section2DOverlayRenderer re-creation (re-applied below).
+    private overlayLineColor: readonly [number, number, number, number] = [0, 0, 0, 1];
     // IfcAnnotation overlay pipelines (issue #653). Created on `init()` once
     // the device exists; nulled until then.
     private symbolicFillPipeline: SymbolicFillPipeline | null = null;
@@ -293,6 +296,8 @@ export class Renderer {
             this.device.getFormat(),
             this.pipeline.getSampleCount()
         );
+        // Re-apply any colour set before this (re)creation so it isn't lost.
+        this.section2DOverlayRenderer.setOverlayLineColor(this.overlayLineColor);
         // IfcAnnotation overlay pipelines (issue #653). Share the device +
         // presentation format AND the MSAA sample count + objectId attachment
         // shape with the rest of the renderer so they composite into the same
@@ -2679,6 +2684,20 @@ export class Renderer {
         if (this.section2DOverlayRenderer) {
             this.section2DOverlayRenderer.clearGeometry();
         }
+    }
+
+    /**
+     * Set the colour of the overlay lines (annotation / alignment / grid) and the
+     * section-cut outline (RGBA, 0..1). Defaults to opaque black; theme it to keep
+     * lines legible on a dark canvas. The matching label colour is per-text via
+     * `SymbolicTextInput.color` on `uploadAnnotationTexts3D`.
+     */
+    setOverlayLineColor(color: readonly [number, number, number, number]): void {
+        // Persist on the Renderer so a pre-init call (and any later overlay
+        // re-creation) keeps the colour — init() re-applies this.overlayLineColor.
+        this.overlayLineColor = color;
+        this.section2DOverlayRenderer?.setOverlayLineColor(color);
+        this.requestRender();
     }
 
     /**
