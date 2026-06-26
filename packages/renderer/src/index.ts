@@ -17,6 +17,7 @@ export { Picker } from './picker.js';
 export { MathUtils } from './math.js';
 export { SectionPlaneRenderer } from './section-plane.js';
 export { Section2DOverlayRenderer } from './section-2d-overlay.js';
+import { aabbEdgeLineList } from './aabb-edges.js';
 
 // IfcAnnotation overlay pipelines (3D world-space). Self-contained — caller
 // passes a GPUDevice + presentation format and invokes `.render(pass, viewProj)`
@@ -2019,7 +2020,8 @@ export class Renderer {
                 const overrideBatches = this.scene.getOverrideBatches();
                 if (overrideBatches.length > 0) {
                     pass.setPipeline(this.pipeline.getOverlayPipeline());
-                    tplFlags[0] = 2;  // set overlay bit for the duration of these draws
+                    // bit 1 = overlay; bit 5 (32) = emphasize (pop) — see shader.
+                    tplFlags[0] = options.emphasizeOverrides ? (2 | 32) : 2;
                     for (const batch of overrideBatches) {
                         renderBatch(batch);
                     }
@@ -2341,6 +2343,9 @@ export class Renderer {
             }
             if (this.section2DOverlayRenderer?.hasGridLines3D()) {
                 this.section2DOverlayRenderer.drawGridLines3D(pass, viewProj);
+            }
+            if (this.section2DOverlayRenderer?.hasClashBoxLines3D()) {
+                this.section2DOverlayRenderer.drawClashBoxLines3D(pass, viewProj);
             }
             if (this.symbolicTextPipeline?.hasGeometry()) {
                 // Pass viewport pixel dimensions so the shader can scale glyphs
@@ -2823,6 +2828,26 @@ export class Renderer {
             this.section2DOverlayRenderer.clearGridLines3D();
             this.requestRender();
         }
+    }
+
+    /**
+     * Show (or clear) the clash-overlap box: the wireframe AABB of a focused
+     * clash, drawn in `color` so the overlap region reads as a distinct third
+     * colour next to the two glowing clash elements (#1277). Pass `null` to
+     * clear. `min`/`max` are world-space corners (clash works in world frame).
+     */
+    setClashOverlapBox(
+        box: { min: [number, number, number]; max: [number, number, number]; color: [number, number, number, number] } | null,
+    ): void {
+        if (!this.section2DOverlayRenderer) return;
+        if (!box) {
+            this.section2DOverlayRenderer.clearClashBoxLines3D();
+            this.requestRender();
+            return;
+        }
+        this.section2DOverlayRenderer.setClashBoxLineColor(box.color);
+        this.section2DOverlayRenderer.uploadClashBoxLines3D(aabbEdgeLineList(box.min, box.max));
+        this.requestRender();
     }
 
     /**

@@ -30,6 +30,7 @@ import { elementsFromStep } from '@ifc-lite/clash/step';
 import { createBCFFromClashResult } from '@ifc-lite/clash/bcf';
 import { writeBCF } from '@ifc-lite/bcf';
 import { getGlobalRenderer } from '@/hooks/useBCF';
+import { buildClashPairColors, CLASH_COLOR_A } from '@/lib/clash/clash-colors';
 import { posthog } from '@/lib/analytics';
 import { downloadBlob } from '@/lib/export/download';
 
@@ -291,12 +292,28 @@ export function useClash() {
       const globalIds: number[] = [];
       if (a) globalIds.push(clash.a.ref);
       if (b) globalIds.push(clash.b.ref);
-      // Replace any existing selection so the camera frames only this clash pair.
+      // Do NOT select the pair. Selecting forced a "selected" state (the 2-SEL
+      // counter, and in isolate/ghost the elements read as selected). Instead we
+      // just glow the two elements in distinct vibrant colours via the clash
+      // highlight channel — the renderer gives highlighted ids the same glow /
+      // opaque / stay-solid-through-ghost treatment as a selection, so the
+      // colours show in highlight, isolate AND ghost with no selection. (#1277/#1339)
       state.clearEntitySelection();
-      state.setSelectedEntityIds(globalIds); // highlight BOTH elements + frame target
-      state.addEntitiesToSelection(refs); // model-aware context for the properties panel
+      // Colour the two elements via the renderer COLOUR-OVERRIDE channel (the
+      // same path the lens uses) — this repaints their actual albedo, so it
+      // works on batched AND GPU-instanced geometry (e.g. Tekla steel members),
+      // and crucially is NOT the selection highlight: the pair shows the distinct
+      // amber/cyan clash colours, never the selection blue. (#1277/#1339)
+      const colors = buildClashPairColors(a ? clash.a.ref : null, b ? clash.b.ref : null);
+      state.setClashHighlightColors(colors); // record for framing + teardown
+      state.setPendingColorUpdates(colors);  // actually paint A amber / B cyan
+      // Mark the overlap REGION (clash.bounds AABB, world frame) as a distinct
+      // third-colour wireframe box (#1277).
+      state.setClashOverlapBox(clash.bounds ? { min: clash.bounds.min, max: clash.bounds.max } : null);
       applyFocusMode(globalIds, mode);
       state.setClashSelectedId(clash.id);
+      // frameSelection also frames the clash ids (see Viewport), so the camera
+      // encloses the pair without a selection.
       requestAnimationFrame(() => state.cameraCallbacks.frameSelection?.());
     },
     [refOf, applyFocusMode],
@@ -311,9 +328,14 @@ export function useClash() {
       const state = useViewerStore.getState();
       const ref = refOf(el);
       if (!ref) return;
+      // Colour-override (no selection), consistent with focusClash — one element
+      // in focus is painted the clash A colour and framed, without a selected
+      // state or the selection-blue.
       state.clearEntitySelection();
-      state.setSelectedEntityIds([el.ref]);
-      state.addEntitiesToSelection([ref]);
+      const one = new Map<number, [number, number, number, number]>([[el.ref, CLASH_COLOR_A]]);
+      state.setClashHighlightColors(one);
+      state.setPendingColorUpdates(one);
+      state.setClashOverlapBox(null);
       applyFocusMode([el.ref], mode);
       requestAnimationFrame(() => state.cameraCallbacks.frameSelection?.());
     },
@@ -341,6 +363,12 @@ export function useClash() {
     if (globalIds.size === 0) return;
     state.setSelectedEntityIds([...globalIds]);
     state.addEntitiesToSelection(refs);
+    // Showing every clashing element at once — an element can be A in one clash
+    // and B in another, so per-pair colours are ambiguous here. Drop any stale
+    // pair colours (restoring an active lens) and rely on the selection outline.
+    state.setClashHighlightColors(null);
+    state.setPendingColorUpdates(state.lensAppliedColors ?? new Map());
+    state.setClashOverlapBox(null);
   }, [refOf]);
 
   const clearHighlight = useCallback((): void => {
@@ -348,6 +376,11 @@ export function useClash() {
     state.clearEntitySelection();
     state.clearIsolation(); // drop any clash isolation so the full model returns
     state.clearGhost(); // and any X-Ray ghosting
+    state.setClashHighlightColors(null);
+    // Restore the colour-override channel to whatever owned it (an active lens),
+    // or clear it — don't leave the clash A/B colours painted. (#1277 review)
+    state.setPendingColorUpdates(state.lensAppliedColors ?? new Map());
+    state.setClashOverlapBox(null);
     setSelectedId(null);
   }, [setSelectedId]);
 
@@ -470,6 +503,9 @@ export function useClash() {
     state.clearEntitySelection();
     state.clearIsolation();
     state.clearGhost();
+    // Drop the clash colour-override (restoring an active lens) + overlap box.
+    state.setPendingColorUpdates(state.lensAppliedColors ?? new Map());
+    state.setClashOverlapBox(null);
     clear();
   }, [clear]);
 

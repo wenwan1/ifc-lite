@@ -26,6 +26,7 @@ import {
 } from '../../hooks/useViewerSelectors.js';
 import { useModelSelection } from '../../hooks/useModelSelection.js';
 import { useLatestRef } from '../../hooks/useLatestRef.js';
+import { CLASH_COLOR_OVERLAP } from '@/lib/clash/clash-colors';
 import { projectToCssScreen } from '../../utils/projectScreen.js';
 import {
   getEntityBounds,
@@ -483,6 +484,20 @@ export function Viewport({
   const selectedEntityIdRef = useLatestRef(selectedEntityId);
   const selectedEntityIdsRef = useLatestRef(selectedEntityIds);
   const selectedModelIndexRef = useLatestRef(selectedModelIndex);
+  // Per-element clash A/B highlight tints (#1277/#1339) — kept in a ref so the
+  // animation loop reads the latest without re-subscribing.
+  const clashHighlightColors = useViewerStore((s) => s.clashHighlightColors);
+  const clashHighlightColorsRef = useLatestRef(clashHighlightColors);
+  // Clash overlap-region wireframe box (#1277): push the focused clash's bounds
+  // to the renderer as a distinct-colour box. Cleared (null) on teardown.
+  const clashOverlapBox = useViewerStore((s) => s.clashOverlapBox);
+  useEffect(() => {
+    const renderer = rendererRef.current;
+    if (!renderer) return;
+    renderer.setClashOverlapBox(
+      clashOverlapBox ? { ...clashOverlapBox, color: CLASH_COLOR_OVERLAP } : null,
+    );
+  }, [clashOverlapBox]);
   const activeToolRef = useRef<string>(activeTool);
   const pendingMeasurePointRef = useLatestRef(pendingMeasurePoint);
   const activeMeasurementRef = useLatestRef(activeMeasurement);
@@ -737,9 +752,14 @@ export function Viewport({
           const geom = geometryRef.current;
           const set = selectedEntityIdsRef.current;
           const single = selectedEntityIdRef.current;
+          // A focused clash glows its pair via the clash-highlight channel WITHOUT
+          // selecting it, so frame those ids too when there's no selection (#1277).
+          const hl = clashHighlightColorsRef.current;
           const ids = set && set.size > 0
             ? Array.from(set)
-            : single !== null ? [single] : [];
+            : hl && hl.size > 0
+              ? Array.from(hl.keys())
+              : single !== null ? [single] : [];
           if (!geom || ids.length === 0) {
             console.warn('[Viewport] frameSelection: No selection or geometry');
             return;
@@ -1180,6 +1200,7 @@ export function Viewport({
     visualEnhancementRef,
     environmentRef,
     selectedEntityIdsRef,
+    clashHighlightColorsRef,
     coordinateInfoRef,
     isInteractingRef,
     lastCameraStateRef,
