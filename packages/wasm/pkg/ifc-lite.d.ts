@@ -416,6 +416,14 @@ export class IfcAPI {
    */
   scanGeometryEntitiesFast(content: string): any;
   /**
+   * Run geometry extraction on `content` and return its typed CSG / opening
+   * diagnostics (the `GeometryDiagnostics` contract) as a JS object, or
+   * `undefined` when nothing diagnostic-worthy happened (no openings, no
+   * failures). Takes the raw IFC bytes (`Uint8Array`) so there is no input-size
+   * cap. The produced meshes are dropped; only the diagnostics are returned.
+   */
+  diagnoseGeometry(content: Uint8Array): any;
+  /**
    * Parse IFC file and extract symbolic representations (Plan,
    * Annotation, FootPrint, Axis). These are 2D curves used for
    * architectural drawings instead of sectioning 3D geometry.
@@ -464,6 +472,13 @@ export class MeshCollection {
    * it twice for the same index yields the second call an empty mesh.
    */
   takeMesh(index: number): MeshDataJs | undefined;
+  /**
+   * The batch's typed CSG / opening diagnostics as a JS object (the
+   * `GeometryDiagnostics` contract), or `undefined` if none were recorded. The
+   * worker merges these across batches. One serialized value keeps the rich
+   * nested shape as a single FFI crossing instead of dozens of getters.
+   */
+  readonly diagnostics: any;
   /**
    * Get RTC offset X (for converting local coords back to world coords)
    * Add this to local X coordinates to get world X coordinates
@@ -1081,6 +1096,7 @@ export interface InitOutput {
   readonly ifcapi_buildPrePassOnce: (a: number, b: number, c: number) => number;
   readonly ifcapi_buildPrePassStreaming: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
   readonly ifcapi_clearPrePassCache: (a: number) => void;
+  readonly ifcapi_diagnoseGeometry: (a: number, b: number, c: number) => number;
   readonly ifcapi_exportCsv: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => void;
   readonly ifcapi_exportGlb: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => void;
   readonly ifcapi_exportGlbFromMeshes: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number) => void;
@@ -1115,6 +1131,7 @@ export interface InitOutput {
   readonly ifcapi_version: (a: number, b: number) => void;
   readonly meshOutline2d: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
   readonly meshcollection_buildingRotation: (a: number, b: number) => void;
+  readonly meshcollection_diagnostics: (a: number) => number;
   readonly meshcollection_geometryHashCount: (a: number) => number;
   readonly meshcollection_geometryHashIds: (a: number) => number;
   readonly meshcollection_geometryHashValues: (a: number) => number;

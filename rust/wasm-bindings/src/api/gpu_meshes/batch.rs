@@ -48,7 +48,7 @@ impl IfcAPI {
         material_element_ids: Option<Vec<u32>>,
         material_color_counts: Option<Vec<u32>>,
         material_colors_rgba: Option<Vec<u8>>,
-    ) -> Vec<ElementMeshOutput> {
+    ) -> (Vec<ElementMeshOutput>, ifc_lite_geometry::GeometryDiagnostics) {
         use crate::api::styling::resolve_element_color;
         use ifc_lite_core::EntityDecoder;
         use ifc_lite_geometry::GeometryRouter;
@@ -386,7 +386,7 @@ impl IfcAPI {
         // goes processAdaptive -> processParallel -> Web Workers ->
         // `processGeometryBatch`, so the log has to fire here or the
         // diagnostic helper never runs for real-world files.
-        let _ = crate::api::drain_and_log_csg_diagnostics(&router, batch_csg_failures);
+        let csg_diag = crate::api::drain_and_log_csg_diagnostics(&router, batch_csg_failures);
 
         // Layered-wall slicing diagnostics (#563): a quiet success summary, but a
         // per-element warning (id + reason) when a sliceable wall fails to slice
@@ -420,7 +420,7 @@ impl IfcAPI {
             }
         }
 
-        outputs
+        (outputs, csg_diag)
     }
 }
 
@@ -453,7 +453,7 @@ impl IfcAPI {
         material_colors_rgba: Option<Vec<u8>>,
     ) -> MeshCollection {
         let num_jobs = jobs_flat.len() / 3;
-        let outputs = self.produce_batch(
+        let (outputs, csg_diag) = self.produce_batch(
             data, jobs_flat, unit_scale, rtc_x, rtc_y, rtc_z, needs_shift, void_keys,
             void_counts, void_values, style_ids, style_colors, plane_angle_to_radians,
             material_element_ids, material_color_counts, material_colors_rgba,
@@ -470,6 +470,7 @@ impl IfcAPI {
                 mesh_collection.push_geometry_hash(out.id, hash);
             }
         }
+        mesh_collection.set_diagnostics(csg_diag);
         mesh_collection
     }
 
@@ -504,7 +505,10 @@ impl IfcAPI {
         material_color_counts: Option<Vec<u32>>,
         material_colors_rgba: Option<Vec<u8>>,
     ) -> Vec<u8> {
-        let outputs = self.produce_batch(
+        // NB: this instanced-only export returns raw shard bytes with no
+        // MeshCollection carrier, so CSG diagnostics are intentionally dropped. It
+        // is not the worker's default path (partitioned/flat carry the counts).
+        let (outputs, _) = self.produce_batch(
             data, jobs_flat, unit_scale, rtc_x, rtc_y, rtc_z, needs_shift, void_keys,
             void_counts, void_values, style_ids, style_colors, plane_angle_to_radians,
             material_element_ids, material_color_counts, material_colors_rgba,
@@ -579,7 +583,7 @@ impl IfcAPI {
         material_colors_rgba: Option<Vec<u8>>,
     ) -> PartitionedBatch {
         let num_jobs = jobs_flat.len() / 3;
-        let outputs = self.produce_batch(
+        let (outputs, csg_diag) = self.produce_batch(
             data, jobs_flat, unit_scale, rtc_x, rtc_y, rtc_z, needs_shift, void_keys,
             void_counts, void_values, style_ids, style_colors, plane_angle_to_radians,
             material_element_ids, material_color_counts, material_colors_rgba,
@@ -664,6 +668,7 @@ impl IfcAPI {
         let rtc = if needs_shift { [rtc_x, rtc_y, rtc_z] } else { [0.0, 0.0, 0.0] };
         let shard =
             ifc_lite_geometry::collate_and_encode(&refs, INSTANCE_MIN_OCCURRENCES as usize, rtc);
+        mesh_collection.set_diagnostics(csg_diag);
         PartitionedBatch {
             meshes: Some(mesh_collection),
             shard,

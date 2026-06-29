@@ -1577,6 +1577,7 @@
     "DecodedInstancedTemplate: interface",
     "DynamicBatchConfig: interface",
     "GeometryBatch: interface",
+    "GeometryDiagnostics: interface",
     "GeometryProcessingResult: interface",
     "GeometryProcessor: class",
     "GeometryProcessorOptions: interface",
@@ -1614,6 +1615,7 @@
     "getGeometryStreamWatchdogMs: function",
     "isTauri: function",
     "isWasmAssetUnavailableError: function",
+    "mergeGeometryDiagnostics: function",
     "pickWorkerCount: function"
   ],
   "@ifc-lite/ids": [
@@ -3600,6 +3602,7 @@
     "DataModel: interface",
     "DocumentAssociation: interface",
     "ErrorResponse: interface",
+    "GeometryDiagnostics: interface",
     "Georeferencing: interface",
     "HealthResponse: interface",
     "IfcServerClient: class",

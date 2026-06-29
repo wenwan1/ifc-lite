@@ -5,6 +5,7 @@
 import init, { initSync, IfcAPI } from '@ifc-lite/wasm';
 import { initWasmWithRetry } from './wasm-init-retry.js';
 import type { MeshData, TessellationQuality } from './types.js';
+import { mergeGeometryDiagnostics, type GeometryDiagnostics } from './diagnostics.js';
 import {
   DEFAULT_BATCH_SIZING,
   resolveBatchSizing,
@@ -237,6 +238,9 @@ export interface GeometryWorkerProgressMessage {
 export interface GeometryWorkerCompleteMessage {
   type: 'complete';
   totalMeshes: number;
+  /** CSG / opening diagnostics merged over this worker's batches (the
+   *  GeometryDiagnostics contract). Omitted when none were recorded. */
+  diagnostics?: GeometryDiagnostics;
 }
 
 export interface GeometryWorkerErrorMessage {
@@ -473,6 +477,10 @@ interface ProcessingSession {
   pendingInstancedGeometryHashes: Map<number, bigint>;
   totalMeshesEmitted: number;
   cumulativeMeshBytes: number;
+  /** CSG / opening diagnostics merged across every batch this load (the
+   *  GeometryDiagnostics contract). Reported once at completion so a silently
+   *  uncut model surfaces a typed summary, not just scattered console warnings. */
+  diagnostics: GeometryDiagnostics | null;
 }
 
 let activeSession: ProcessingSession | null = null;
@@ -532,6 +540,7 @@ function startSession(input: {
     pendingInstancedGeometryHashes: new Map(),
     totalMeshesEmitted: 0,
     cumulativeMeshBytes: 0,
+    diagnostics: null,
   };
 }
 
@@ -677,6 +686,17 @@ function collectMeshes(
     for (const [id, hash] of geometryHashes) {
       if (!flatMeshedIds.has(id)) session.pendingInstancedGeometryHashes.set(id, hash);
     }
+    // CSG / opening diagnostics: merge into the per-load accumulator only AFTER
+    // mesh extraction succeeds (both batch paths attach a GeometryDiagnostics to
+    // the collection). A batch that throws is binary-split + re-run by
+    // processBatch; doing the merge here means the failed attempt contributes
+    // nothing and the re-run is the sole contributor, so totalCsgFailures and the
+    // classification counts stay exact. The diagnostics field is not consumed by
+    // takeMesh, so it is still readable after the extraction loop.
+    session.diagnostics = mergeGeometryDiagnostics(
+      session.diagnostics,
+      collection.diagnostics as GeometryDiagnostics | undefined,
+    );
   } finally {
     collection.free();
   }
@@ -855,8 +875,16 @@ function emitSessionEnd(session: ProcessingSession): void {
   (self as unknown as Worker).postMessage(
     { type: 'memory', meshBytes: session.cumulativeMeshBytes, wasmHeapBytes } as GeometryWorkerMemoryMessage,
   );
+  // The aggregate per-load console summary is logged once by the parallel loader
+  // (geometry-parallel.ts), which holds the cross-worker total. This worker only
+  // forwards its own subtotal on the message; logging here would print one partial
+  // line per worker.
   (self as unknown as Worker).postMessage(
-    { type: 'complete', totalMeshes: session.totalMeshesEmitted } as GeometryWorkerCompleteMessage,
+    {
+      type: 'complete',
+      totalMeshes: session.totalMeshesEmitted,
+      ...(session.diagnostics ? { diagnostics: session.diagnostics } : {}),
+    } as GeometryWorkerCompleteMessage,
   );
 }
 

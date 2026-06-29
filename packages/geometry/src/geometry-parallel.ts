@@ -27,6 +27,7 @@
 import type { CoordinateHandler } from './coordinate-handler.js';
 import type { MeshData, TessellationQuality } from './types.js';
 import type { StreamingGeometryEvent } from './index.js';
+import { mergeGeometryDiagnostics, type GeometryDiagnostics } from './diagnostics.js';
 import { computeWorkerCount } from './worker-count.js';
 import type { BatchSizingConfig } from './batch-sizing.js';
 import { notifyIfWasmAssetUnavailable } from './wasm-asset-error.js';
@@ -258,6 +259,9 @@ export async function* processParallel(
   let workerError: Error | null = null;
   let workersCompleted = 0;
   let totalMeshes = 0;
+  // CSG / opening diagnostics merged across all workers, forwarded on the final
+  // completion event so loadFile callers can read a typed per-load summary.
+  let diagnostics: GeometryDiagnostics | null = null;
   let endSentToWorkers = false;
   let streamStartSentToWorkers = false;
   /**
@@ -408,6 +412,7 @@ export async function* processParallel(
         // of batch lengths we observed, a batch was lost — log but
         // trust our observed count to keep totalSoFar consistent
         // with what consumers actually rendered.
+        diagnostics = mergeGeometryDiagnostics(diagnostics, msg.diagnostics);
         workersCompleted++;
         worker.terminate();
         wake();
@@ -995,7 +1000,25 @@ export async function* processParallel(
   }
 
   const coordinateInfo = coordinator.getFinalCoordinateInfo();
-  yield { type: 'complete', totalMeshes, coordinateInfo };
+  // One aggregate per-load summary (only this scope holds the cross-worker
+  // total). Counts include batch-summed upper bounds; see the event-type doc.
+  // `diagnostics` is only reassigned inside the message-handler closure; restore
+  // its declared union type at this yield via a cast (a bare reference compiled to
+  // an unhelpful narrowed type under the generator's control-flow analysis).
+  const loadDiagnostics = diagnostics as GeometryDiagnostics | null;
+  if (loadDiagnostics && loadDiagnostics.totalCsgFailures > 0) {
+    console.warn(
+      `[ifc-lite] ${loadDiagnostics.totalCsgFailures} CSG failure(s) across ` +
+        `${loadDiagnostics.productsWithFailures} product(s) this load - some ` +
+        `openings/voids may be left uncut`,
+    );
+  }
+  yield {
+    type: 'complete',
+    totalMeshes,
+    coordinateInfo,
+    ...(loadDiagnostics ? { diagnostics: loadDiagnostics } : {}),
+  };
   } finally {
     for (const w of workers) {
       try { w.terminate(); } catch { /* cleanup — safe to ignore */ }

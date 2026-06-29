@@ -26,6 +26,11 @@ export {
   type MetadataBootstrapSpatialNode,
 } from './platform-bridge.js';
 
+// Public CSG / opening diagnostics contract (surfaced on the streaming `complete`
+// event and the native ProcessingStats).
+export type { GeometryDiagnostics } from './diagnostics.js';
+export { mergeGeometryDiagnostics } from './diagnostics.js';
+
 // Support components
 export { BufferBuilder } from './buffer-builder.js';
 export { CoordinateHandler } from './coordinate-handler.js';
@@ -202,7 +207,16 @@ export type StreamingGeometryEvent =
    * is additive.
    */
   | { type: 'progress'; phase: 'prepass' | 'workers' }
-  | { type: 'complete'; totalMeshes: number; coordinateInfo: import('./types.js').CoordinateInfo };
+  | {
+      type: 'complete';
+      totalMeshes: number;
+      coordinateInfo: import('./types.js').CoordinateInfo;
+      /** CSG / opening diagnostics aggregated over the whole load (the
+       *  GeometryDiagnostics contract). Omitted when none were recorded or on
+       *  non-parallel load paths. See ./diagnostics.ts for the field semantics
+       *  and which counts are exact vs batch-summed upper bounds. */
+      diagnostics?: import('./diagnostics.js').GeometryDiagnostics;
+    };
 
 // QueuedNativeStreamingEvent, native stream constants, and yieldToEventLoop
 // have been extracted to ./geometry-native.ts
@@ -1120,6 +1134,17 @@ export class GeometryProcessor {
   ): Uint8Array | null {
     if (!this.bridge?.isInitialized()) return null;
     return this.bridge.exportGlb(buffer, includeMetadata, hidden, isolated, hiddenTypesCsv, lit);
+  }
+
+  /**
+   * Run geometry extraction on `buffer` and return its typed CSG / opening
+   * diagnostics (the `GeometryDiagnostics` contract), or `undefined` when nothing
+   * diagnostic-worthy happened or the bridge is not initialized. The meshes are
+   * discarded - this is the diagnostics-only surface for the CLI / SDK.
+   */
+  diagnoseGeometry(buffer: Uint8Array): import('./diagnostics.js').GeometryDiagnostics | undefined {
+    if (!this.bridge?.isInitialized()) return undefined;
+    return this.bridge.diagnoseGeometry(buffer);
   }
 
   exportCsv(
