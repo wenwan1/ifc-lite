@@ -38,6 +38,7 @@ use tower_http::{
 
 mod admission;
 mod config;
+mod mem_policy;
 mod error;
 mod middleware;
 mod routes;
@@ -218,14 +219,37 @@ async fn main() {
         shed_pct: config.mem_shed_pct,
     }));
     admission::spawn_rss_sampler(Arc::clone(&admission));
-    tracing::info!(
-        max_concurrent_parses = config.max_concurrent_parses,
-        mem_budget_mb = config.mem_budget_mb,
-        queue_depth = config.admission_queue_depth,
-        queue_timeout_secs = config.admission_queue_timeout_secs,
-        shed_pct = config.mem_shed_pct,
-        "Admission control active (mem budget 0 = byte gate disabled)"
-    );
+    if config.mem_budget_mb == 0 {
+        // Budget 0 = memory gate off. Two distinct causes; log them differently:
+        //  - explicit `IFC_MEM_BUDGET_MB=0`: the operator opted out deliberately
+        //    (info, not a warning);
+        //  - no readable ceiling (non-Linux dev, /proc unavailable): a silent
+        //    degradation that risks OOM, so warn.
+        let opted_out = std::env::var("IFC_MEM_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            == Some(0);
+        if opted_out {
+            tracing::info!(
+                max_concurrent_parses = config.max_concurrent_parses,
+                "Memory admission disabled via IFC_MEM_BUDGET_MB=0 (opt-out); only the CPU concurrency gate applies."
+            );
+        } else {
+            tracing::warn!(
+                max_concurrent_parses = config.max_concurrent_parses,
+                "Memory admission is OFF (no readable memory ceiling: non-Linux host or /proc unavailable): concurrent large uploads can OOM this replica. Set IFC_MEM_BUDGET_MB, or run under a cgroup memory limit."
+            );
+        }
+    } else {
+        tracing::info!(
+            max_concurrent_parses = config.max_concurrent_parses,
+            mem_budget_mb = config.mem_budget_mb,
+            queue_depth = config.admission_queue_depth,
+            queue_timeout_secs = config.admission_queue_timeout_secs,
+            shed_pct = config.mem_shed_pct,
+            "Admission control active (byte budget + RSS breaker)"
+        );
+    }
 
     let state = AppState {
         cache,
