@@ -21,16 +21,19 @@
 //! JS via `serde_wasm_bindgen::to_value`, exactly like `diagnoseGeometry`.
 //!
 //! Population:
-//! - wasm: accumulated on the NORMAL load path — every
-//!   `processGeometryBatch*` call folds one [`Self::record_batch`] in
-//!   (cheap counters plus two `js_sys::Date::now()` reads per batch, so it
-//!   is always on). `std::time::Instant` traps on wasm32, so the wasm side
-//!   fills only `phase_ms.geometry_ms` (summed batch wall time); the
-//!   scan/prepass phases run in JS workers outside the wasm module and are
-//!   reported as 0 there.
-//! - native: one-shot from the finished pass via
-//!   [`Self::from_processing_stats`], which maps the full `ProcessingStats`
-//!   phase timers.
+//! - wasm: the LIVE channel. Accumulated on the NORMAL load path — every
+//!   `processGeometryBatch*` call folds one [`Self::record_batch`] in (cheap
+//!   counters plus two `js_sys::Date::now()` reads per batch, so it is always
+//!   on). `std::time::Instant` traps on wasm32, so only `phase_ms.geometry_ms`/
+//!   `total_ms` are filled; the scan/prepass phases run in JS workers outside
+//!   the wasm module and stay 0.
+//! - native: [`Self::from_processing_stats`] maps a finished `ProcessingStats`
+//!   (all phase timers available) into this shape. It is provided for a native
+//!   consumer that wants the unified vocabulary, but is NOT wired into a live
+//!   server/CLI pipeline today — those surface the same numbers directly via
+//!   `ProcessingStats` + [`GeometryDiagnostics`]. So the wasm getter is the only
+//!   shipping producer; the native constructor is available API, not a second
+//!   projection kept in lockstep.
 
 use crate::types::response::ProcessingStats;
 use ifc_lite_geometry::{GeometryDiagnostics, RectFastSummary};
@@ -55,10 +58,10 @@ pub struct PipelinePhaseTimings {
     pub parse_ms: u64,
     /// Per-element geometry extraction (meshing + CSG).
     pub geometry_ms: u64,
-    /// End-to-end wall time of the pass. On the NATIVE single-pass builder
-    /// this is the true end-to-end figure; on the wasm batch path it is the
-    /// SUM of per-batch geometry wall time (the parse-phase timers live in
-    /// the pre-pass and JS orchestration there), i.e. a lower bound.
+    /// End-to-end wall time of the pass. On the wasm batch path this is the
+    /// SUM of per-batch geometry wall time (the parse-phase timers live in the
+    /// pre-pass and JS orchestration outside the wasm module), i.e. a lower
+    /// bound on the true end-to-end figure.
     pub total_ms: u64,
 }
 
@@ -153,9 +156,12 @@ impl PipelineDiagnostics {
         self.phase_ms.total_ms += geometry_ms;
     }
 
-    /// Build the same contract from a finished native pass. The native
-    /// pipeline is single-pass, so `batches` is 1 and every phase timer is
-    /// available.
+    /// Map a finished native pass into this shape. The native pipeline is
+    /// single-pass, so `batches` is 1 and every phase timer is available.
+    ///
+    /// Available API for a native consumer that wants the unified diagnostics
+    /// vocabulary; not wired into a live server/CLI pipeline today (see the
+    /// module docs). The wasm getter uses [`Self::record_batch`], not this.
     pub fn from_processing_stats(stats: &ProcessingStats, element_count: u64) -> Self {
         let (hosts_with_openings, silent_no_ops, rect_fast) = match &stats.geometry_diagnostics {
             Some(d) => (d.hosts_with_openings, d.silent_no_ops, d.rect_fast),
