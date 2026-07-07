@@ -262,7 +262,7 @@ const PREFILTER_MIN: usize = 32;
 
 /// `p`'s coordinates dropped to the kept 2D plane for projection `axis`.
 #[inline]
-fn project2d(p: [f64; 3], axis: DropAxis) -> [f64; 2] {
+pub(crate) fn project2d(p: [f64; 3], axis: DropAxis) -> [f64; 2] {
     match axis {
         DropAxis::X => [p[1], p[2]],
         DropAxis::Y => [p[0], p[2]],
@@ -861,10 +861,10 @@ fn enforce_constraint(mesh: &mut Mesh2d, it: &Interner, s: Vid, t: Vid) {
 
 /// Phases A–D: project, canonicalise, insert all constraint points, then force
 /// every constraint to appear as an edge (chain). `None` ⇒ `T` is degenerate.
-/// (seg×seg crossings and coplanar/touching cases are deferred increments.)
 pub fn triangulate(input: &RetriInput, interner: &mut Interner) -> Option<Mesh2d> {
     let (axis, w0) = projection_axis(&input.tri)?;
-    let canon = canonicalize(input, interner);
+    let mut canon = canonicalize(input, interner);
+    super::retriangulate_cleanup::drop_out_of_plane(&mut canon, &input.tri, interner, axis); // #098
     let mut mesh = Mesh2d {
         tris: vec![canon.corners],
         axis,
