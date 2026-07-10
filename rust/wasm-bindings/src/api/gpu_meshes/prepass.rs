@@ -250,6 +250,12 @@ impl IfcAPI {
         // already stashed in `prepass_spans`.
         let mut mapped_item_spans: Vec<(u32, usize, usize)> = Vec::new();
         let mut rel_defines_by_type_spans: Vec<(u32, usize, usize)> = Vec::new();
+        // #957/#962: IfcTypeProduct candidates (id, span, resolved type), stashed
+        // here so the orphan-type-geometry pass reuses THIS scan instead of a
+        // second full EntityScanner walk over the file. `IfcType` is captured
+        // from the scanner's `type_name` so it matches `collect_type_geometry_jobs`
+        // byte-for-byte.
+        let mut type_candidate_spans: Vec<(u32, usize, usize, IfcType)> = Vec::new();
         // Mirror `get_or_build_material_layer_index`'s `IFCMATERIALLAYERSET`
         // substring gate exactly, but detect it from the scan (a layer-set
         // keyword only appears as an entity type) so we never re-scan the file:
@@ -355,6 +361,18 @@ impl IfcAPI {
                     has_layer_set = true;
                 }
                 _ => {
+                    // #957/#962: an IfcTypeProduct subtype (its geometry is
+                    // authored on RepresentationMaps, not the type itself, so it
+                    // never matches `has_geometry_by_name`). Stash it for the
+                    // orphan-type pass; the RepresentationMaps attr-6 decode +
+                    // referenced-filter happens later in
+                    // `collect_type_geometry_jobs_from_spans`.
+                    if type_name.ends_with("TYPE") || type_name.ends_with("STYLE") {
+                        let type_ty = IfcType::from_str(type_name);
+                        if type_ty.is_subtype_of(IfcType::IfcTypeProduct) {
+                            type_candidate_spans.push((id, start, end, type_ty));
+                        }
+                    }
                     if has_geometry_by_name(type_name) && !disabled_types.contains(type_name) {
                         let ifc_type = IfcType::from_str(type_name);
                         // We don't bucket by simple/complex here — the host
@@ -706,19 +724,23 @@ impl IfcAPI {
         // (geometry on the type via RepresentationMaps, no occurrence). The
         // entity index is complete here, so this resolves cleanly.
         //
-        // PERF (flagged, #962 review): for files WITH representation maps this is
-        // a second linear EntityScanner pass over `content` on top of the
-        // streaming scan above. A `IFCREPRESENTATIONMAP` substring guard inside
-        // the helper makes the ~all-files-without-type-geometry case free (just a
-        // SIMD memmem). The remaining instanced-file cost is a tracked follow-up:
-        // fold the mapped-item-source + type-candidate collection into the
-        // streaming scan loop so orphans resolve with no extra pass. Kept as a
-        // separate pass for now to avoid destabilising the streaming hot path.
+        // #962 done: the mapped-item source + type-candidate spans were collected
+        // by the streaming scan above, so this resolves orphans from those stashes
+        // with NO second EntityScanner pass. The gate is the SAME predicate the old
+        // `collect_type_geometry_jobs` bailed on — an `IFCREPRESENTATIONMAP`
+        // substring (a SIMD memmem, not a full scan) — so behaviour stays byte-
+        // identical to the old path and `combined_pre_pass`, free on the no-type case.
         // #1097 perf: the viewer's default Model view does not render the
         // type-library (#957) geometry, so skip producing it at load when the
         // caller asks (the Types view re-loads on demand).
-        if !skip_type_geometry {
-            let type_jobs = crate::api::styling::collect_type_geometry_jobs(content, &mut decoder);
+        if !skip_type_geometry
+            && memchr::memmem::find(content, b"IFCREPRESENTATIONMAP").is_some()
+        {
+            let type_jobs = crate::api::styling::collect_type_geometry_jobs_from_spans(
+                &mapped_item_spans,
+                &type_candidate_spans,
+                &mut decoder,
+            );
             if !type_jobs.is_empty() {
                 total_jobs += type_jobs.len() as u32;
                 // Type-library geometry is a small, usually-suppressed tail; route
