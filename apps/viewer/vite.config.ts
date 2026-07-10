@@ -241,6 +241,7 @@ export default defineConfig({
       '@ifc-lite/data': path.resolve(__dirname, '../../packages/data/src'),
       '@ifc-lite/export': path.resolve(__dirname, '../../packages/export/src'),
       '@ifc-lite/cache': path.resolve(__dirname, '../../packages/cache/src'),
+      '@ifc-lite/collab': path.resolve(__dirname, '../../packages/collab/src'),
       '@ifc-lite/ifcx': path.resolve(__dirname, '../../packages/ifcx/src'),
       '@ifc-lite/pointcloud': path.resolve(__dirname, '../../packages/pointcloud/src'),
       '@ifc-lite/wasm': path.resolve(__dirname, '../../packages/wasm/pkg/ifc-lite.js'),
