@@ -45,6 +45,7 @@ import {
   type RegistryReviewTopic,
   type RegistryReviewDecision,
 } from './layer-registry.js';
+import { emitRegistryEvent, type RegistryWebhook } from './registry-webhooks.js';
 
 /** Resolve the acting principal, or null to reject with 401. */
 export type RegistryAuthorizeFn = (
@@ -58,6 +59,8 @@ export interface LayerRegistryRouteOptions {
   maxBytes?: number;
   /** When omitted, traffic is anonymous (dev/tests) — matches the blob route. */
   authorize?: RegistryAuthorizeFn;
+  /** Event consumers (08-review.md §8.7); empty = no emission. */
+  webhooks?: readonly RegistryWebhook[];
 }
 
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -134,7 +137,76 @@ function parseRefPolicy(value: unknown): RefPolicy | undefined {
     }
     policy.requiredChecks = raw.requiredChecks;
   }
+  if (raw.autoMerge !== undefined) {
+    if (typeof raw.autoMerge !== 'boolean') return undefined;
+    policy.autoMerge = raw.autoMerge;
+  }
   return policy;
+}
+
+/**
+ * Auto-merge (10-registry.md §10.4): after a push, conflict-free +
+ * all-green candidates merge unattended into every `autoMerge` ref.
+ * Fail-closed by construction:
+ *  - `requireHumanApproval` refs never auto-merge (an unattended merge
+ *    cannot satisfy an approval).
+ *  - Baseless candidates never auto-merge (three-way against an empty
+ *    ancestor reads every op as "new" — a disjoint layer would land on
+ *    every auto-merge ref).
+ *  - `conflicts` / `policy-failure` / `unrelated-base` outcomes have no
+ *    side effects in the shared flow, and any throw is contained — an
+ *    auto-merge can never fail the push that triggered it.
+ */
+function runAutoMerges(
+  registry: LayerRegistryStore,
+  pushedId: string,
+  webhooks: readonly RegistryWebhook[]
+): void {
+  let manifest;
+  try {
+    manifest = getProvenance(registry.loadLayer(pushedId));
+  } catch {
+    return;
+  }
+  if (!manifest?.base) return;
+  // "All-green" is the whole candidate manifest, not just the ref's
+  // required checks: a failing check the policy forgot to require must
+  // still keep the merge attended.
+  if ((manifest.checks ?? []).some((check) => check.result !== 'pass')) return;
+  for (const [name, entry] of Object.entries(registry.listRefs())) {
+    const policy = entry.policy;
+    if (!policy?.autoMerge || policy.requireHumanApproval) continue;
+    if (entry.layers.includes(pushedId)) continue;
+    // Idempotency: a candidate that already landed via a three-way merge
+    // is represented by its MERGE layer, not its own id — re-merging it
+    // would append a duplicate (usually empty) merge layer per re-push.
+    const alreadyMerged = entry.layers.some((layerId) => {
+      try {
+        return getProvenance(registry.loadLayer(layerId))?.merge?.candidate === pushedId;
+      } catch {
+        return false;
+      }
+    });
+    if (alreadyMerged) continue;
+    try {
+      const outcome = mergeIntoRef(registry, {
+        candidateId: pushedId,
+        into: name,
+        principal: 'registry-automerge',
+      });
+      if (outcome.status === 'fast-forward' || outcome.status === 'merged') {
+        emitRegistryEvent(webhooks, 'ref.merged', {
+          ref: name,
+          candidate: pushedId,
+          status: outcome.status,
+          auto: true,
+          ...(outcome.status === 'merged' ? { merge_layer: outcome.mergeLayerId } : {}),
+        });
+      }
+    } catch {
+      // Contained by contract (see above).
+    }
+  }
 }
 
 /** Runtime shape validation for review decisions; undefined = invalid. */
@@ -188,6 +260,7 @@ export async function handleLayerRegistryRequest(
   }
   const registry = opts.registry;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  const webhooks = opts.webhooks ?? [];
 
   // ----- layers ------------------------------------------------------------
   if (head === 'layers') {
@@ -231,7 +304,10 @@ export async function handleLayerRegistryRequest(
         }
       }
       try {
-        return json(res, 201, { id: registry.push(file) });
+        const id = registry.push(file);
+        emitRegistryEvent(webhooks, 'layer.pushed', { id });
+        runAutoMerges(registry, id, webhooks);
+        return json(res, 201, { id });
       } catch (err) {
         const handled = handlePushError(res, err);
         if (handled) return handled;
@@ -346,6 +422,9 @@ export async function handleLayerRegistryRequest(
         const handled = handlePushError(res, err);
         if (handled) return handled;
         throw err;
+      }
+      if (body?.layers !== undefined) {
+        emitRegistryEvent(webhooks, 'ref.moved', { ref: name, layers: entry.layers });
       }
       return json(res, existing ? 200 : 201, { ref: name, ...entry });
     }
@@ -488,8 +567,21 @@ export async function handleLayerRegistryRequest(
       }
       switch (outcome.status) {
         case 'fast-forward':
+          emitRegistryEvent(webhooks, 'ref.merged', {
+            ref: segments[1],
+            candidate: body.candidate,
+            status: outcome.status,
+            auto: false,
+          });
           return json(res, 200, { status: outcome.status, layers: outcome.refLayers });
         case 'merged':
+          emitRegistryEvent(webhooks, 'ref.merged', {
+            ref: segments[1],
+            candidate: body.candidate,
+            status: outcome.status,
+            auto: false,
+            merge_layer: outcome.mergeLayerId,
+          });
           return json(res, 200, {
             status: outcome.status,
             merge_layer: outcome.mergeLayerId,
@@ -548,6 +640,7 @@ export async function handleLayerRegistryRequest(
       if (handled) return handled;
       throw err;
     }
+    emitRegistryEvent(webhooks, 'review.opened', { id: review.id, layer_id: review.layerId, into: review.into });
     return json(res, 201, { id: review.id });
   }
   // Review comments as BCF topics bound to (review, entity, componentKey?)
@@ -605,6 +698,7 @@ export async function handleLayerRegistryRequest(
         if (handled) return handled;
         throw err;
       }
+      emitRegistryEvent(webhooks, 'review.commented', { id: review.id, guid: topic.guid, entity: topic.entity });
       return json(res, 201, { guid: topic.guid, topic_count: review.topics.length });
     }
     return json(res, 405, { error: `unsupported ${method} on review topics` });
@@ -661,6 +755,11 @@ export async function handleLayerRegistryRequest(
       else delete review.approvedBy;
     }
     registry.putReview(review);
+    emitRegistryEvent(webhooks, 'review.updated', {
+      id: review.id,
+      status: review.status,
+      decision_count: review.feedback.length,
+    });
     return json(res, 200, { id: review.id, status: review.status, decision_count: review.feedback.length });
   }
   return json(res, 405, { error: `unsupported ${method} on reviews` });
