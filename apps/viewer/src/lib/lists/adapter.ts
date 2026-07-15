@@ -18,8 +18,11 @@ import {
   extractEntityAttributesOnDemand,
   extractMaterialsOnDemand,
   extractClassificationsOnDemand,
+  extractTypePropertiesOnDemand,
+  extractTypeQuantitiesOnDemand,
 } from '@ifc-lite/parser';
 import type { PropertySet, QuantitySet } from '@ifc-lite/data';
+import { RelationshipType } from '@ifc-lite/data';
 import { ENTITY_ATTRIBUTES } from '@ifc-lite/lists';
 import type { ListDataProvider, ListClassificationRef, DiscoveredColumns } from '@ifc-lite/lists';
 import { resolveEntityPredefinedType } from '../entity-predefined-type.js';
@@ -108,6 +111,22 @@ export function createListDataProvider(store: IfcDataStore, modelName = ''): Lis
   const usesOnDemandProps = !!store.onDemandPropertyMap && store.source?.length > 0;
   const usesOnDemandQtos = !!store.onDemandQuantityMap && store.source?.length > 0;
 
+  // Geometry-bearing (selectable) products — the raw expressId column also
+  // holds relationships, psets, materials, etc., which a class-less list must
+  // not surface as rows. Cached; also reused by column discovery to enumerate
+  // the model's element types.
+  function selectableIds(): number[] {
+    if (allIdsCache) return allIdsCache;
+    const ids: number[] = [];
+    const col = store.entities.expressId;
+    for (let i = 0; i < col.length; i++) {
+      const id = col[i];
+      if (id && store.entities.hasGeometry(id)) ids.push(id);
+    }
+    allIdsCache = ids;
+    return ids;
+  }
+
   function getPropertySetsFor(entityId: number): PropertySet[] {
     if (usesOnDemandProps) return extractPropertiesOnDemand(store, entityId) as PropertySet[];
     return store.properties?.getForEntity(entityId) ?? [];
@@ -116,6 +135,52 @@ export function createListDataProvider(store: IfcDataStore, modelName = ''): Lis
   function getQuantitySetsFor(entityId: number): QuantitySet[] {
     if (usesOnDemandQtos) return extractQuantitiesOnDemand(store, entityId) as QuantitySet[];
     return store.quantities?.getForEntity(entityId) ?? [];
+  }
+
+  // ── Type-inherited property/quantity fallback (issue #1745) ──
+  // Resolve the element's IfcTypeProduct once, then cache the extracted type
+  // psets/qtos BY TYPE ID so a schedule over thousands of instances sharing a
+  // type parses that type only once. `entityToTypeId` memoises the (cheap)
+  // relationship lookup; -1 marks "no type" so we don't re-probe.
+  const entityToTypeId = new Map<number, number>();
+  const typePsetCache = new Map<number, PropertySet[]>();
+  const typeQsetCache = new Map<number, QuantitySet[]>();
+
+  function definingTypeId(entityId: number): number {
+    const cached = entityToTypeId.get(entityId);
+    if (cached !== undefined) return cached;
+    const ids = store.relationships?.getRelated(entityId, RelationshipType.DefinesByType, 'inverse') ?? [];
+    const typeId = ids.length > 0 ? ids[0] : -1;
+    entityToTypeId.set(entityId, typeId);
+    return typeId;
+  }
+
+  // NOTE: type fallback covers the CLIENT (WASM) parse path — the store that
+  // backs the in-browser viewer, which is the #1745 scenario. The server-parse
+  // path (convertServerDataModel) does not surface the element→type relationship
+  // at all (it drops IfcRelDefinesByType and leaves `definedByType` unset), so
+  // `definingTypeId` returns -1 there and these accessors correctly no-op.
+  // Wiring server-parsed stores is tracked as a follow-up (needs the Rust
+  // relationship + type-pset emission), so we deliberately do NOT add a table
+  // fallback here that could never fire.
+  function getTypePropertySetsFor(entityId: number): PropertySet[] {
+    const typeId = definingTypeId(entityId);
+    if (typeId < 0) return [];
+    const cached = typePsetCache.get(typeId);
+    if (cached) return cached;
+    const psets = (extractTypePropertiesOnDemand(store, entityId)?.properties ?? []) as PropertySet[];
+    typePsetCache.set(typeId, psets);
+    return psets;
+  }
+
+  function getTypeQuantitySetsFor(entityId: number): QuantitySet[] {
+    const typeId = definingTypeId(entityId);
+    if (typeId < 0) return [];
+    const cached = typeQsetCache.get(typeId);
+    if (cached) return cached;
+    const qsets = (extractTypeQuantitiesOnDemand(store, entityId)?.quantities ?? []) as QuantitySet[];
+    typeQsetCache.set(typeId, qsets);
+    return qsets;
   }
 
   return {
@@ -131,21 +196,11 @@ export function createListDataProvider(store: IfcDataStore, modelName = ''): Lis
 
     getPropertySets: getPropertySetsFor,
     getQuantitySets: getQuantitySetsFor,
+    getTypePropertySets: getTypePropertySetsFor,
+    getTypeQuantitySets: getTypeQuantitySetsFor,
 
     getAllEntityIds(): number[] {
-      if (allIdsCache) return allIdsCache;
-      // Restrict "all elements" to geometry-bearing (selectable) products.
-      // The raw expressId column also holds relationships, property sets,
-      // materials, classifications and other non-element records — a
-      // class-less list should not surface those as rows.
-      const ids: number[] = [];
-      const col = store.entities.expressId;
-      for (let i = 0; i < col.length; i++) {
-        const id = col[i];
-        if (id && store.entities.hasGeometry(id)) ids.push(id);
-      }
-      allIdsCache = ids;
-      return ids;
+      return selectableIds();
     },
 
     getMaterialNames(entityId: number): string[] {
@@ -230,6 +285,30 @@ export function createListDataProvider(store: IfcDataStore, modelName = ''): Lis
           seen++;
           if (!usesOnDemandProps) ingestProps(id);
           if (!usesOnDemandQtos) ingestQtos(id);
+        }
+      }
+
+      // Type-level sets (#1745): a pset/qto that lives ONLY on an element's
+      // IfcTypeProduct must also be offered by the picker — otherwise the
+      // fallback resolves values (e.g. a type-only Manufacturer) the user has
+      // no way to select. Enumerate each selectable element's type once
+      // (deduped by type id; getType*SetsFor caches the extraction per type).
+      const seenTypeIds = new Set<number>();
+      for (const id of selectableIds()) {
+        const typeId = definingTypeId(id);
+        if (typeId < 0 || seenTypeIds.has(typeId)) continue;
+        seenTypeIds.add(typeId);
+        for (const set of getTypePropertySetsFor(id)) {
+          if (!set.name) continue;
+          let bucket = properties.get(set.name);
+          if (!bucket) { bucket = new Set(); properties.set(set.name, bucket); }
+          for (const p of set.properties) if (p.name) bucket.add(p.name);
+        }
+        for (const set of getTypeQuantitySetsFor(id)) {
+          if (!set.name) continue;
+          let bucket = quantities.get(set.name);
+          if (!bucket) { bucket = new Set(); quantities.set(set.name, bucket); }
+          for (const q of set.quantities) if (q.name) bucket.add(q.name);
         }
       }
 
