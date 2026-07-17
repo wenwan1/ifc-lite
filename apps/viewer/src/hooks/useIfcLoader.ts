@@ -18,7 +18,8 @@ import { getGeomWorkerOverride, resolveLoadTessellationTier, isMeshOnlyCacheEnab
 import { planCacheWrite, decideMeshOnlyCacheHit } from './cacheTier.js';
 import { computeSourceFingerprint } from './sourceFingerprint.js';
 import { computeFullSourceHash } from '../utils/sourceContentHash.js';
-import { IfcParser, detectFormat, unwrapIfcZip, type IfcDataStore } from '@ifc-lite/parser';
+import { IfcParser, detectFormat, unwrapIfcZipWithResources, type IfcDataStore } from '@ifc-lite/parser';
+import { decodeTextureResources, attachTextureBitmaps, type TextureBitmapStore } from '../utils/textureResources.js';
 import { WorkerParser } from '@ifc-lite/parser/browser';
 import { memoryAccounting } from '../lib/perf/memoryAccounting.js';
 import {
@@ -374,7 +375,16 @@ export function useIfcLoader() {
           const maxExpressId = getMaxExpressId(dataStore, geometryResult.meshes);
           const idOffset = registerModelOffset(modelId, maxExpressId);
           if (idOffset > 0) {
-            for (const mesh of geometryResult.meshes) mesh.expressId = mesh.expressId + idOffset;
+            for (const mesh of geometryResult.meshes) {
+              mesh.expressId = mesh.expressId + idOffset;
+              // #1781: textureId is an express id too — offset it with the same
+              // shift so two federated models can't collide in the renderer's
+              // shared-texture registry (model B's texture #34 must never sample
+              // model A's image).
+              if (mesh.textureRef) {
+                mesh.textureRef = { ...mesh.textureRef, textureId: mesh.textureRef.textureId + idOffset };
+              }
+            }
             for (const asset of geometryResult.pointClouds ?? []) asset.expressId = asset.expressId + idOffset;
           }
           if (idOffset > 0 && patch?.pointCloudHandleId !== undefined) {
@@ -481,8 +491,17 @@ export function useIfcLoader() {
       // server unwraps `.ifcZIP` itself (apps/server extract_file), so a zipped
       // upload can still take the server fast-path; the local WASM path
       // consumes the now-unwrapped `buffer`.
+      let textureBitmaps: TextureBitmapStore | null = null;
       if (!pointCloudFormat) {
-        buffer = await unwrapIfcZip(buffer);
+        const zipContents = await unwrapIfcZipWithResources(buffer);
+        buffer = zipContents.model;
+        // #1781: decode sibling texture images (IfcImageTexture targets) once,
+        // up front — mesh batches attach the shared bitmaps synchronously as
+        // they arrive. Empty/no-zip loads resolve to null and pay nothing.
+        textureBitmaps = await decodeTextureResources(zipContents.resources);
+        if (textureBitmaps) {
+          console.log(`[useIfc] Decoded ${textureBitmaps.size} .ifcZIP texture image(s)`);
+        }
       }
 
       // IFCX/IFC5 vs IFC4 STEP vs GLB resolved from the full buffer; point
@@ -736,7 +755,11 @@ export function useIfcLoader() {
 
       // Cache + server are PRIMARY-ONLY: a federated add is WASM-only with no
       // cache/server round-trip (matches the former parseStepBufferViewerModel).
-      if (target.kind === 'primary' && cachePlan.shouldCache) {
+      // Texture-carrying .ifcZIPs also bypass the cache READ (#1781): the format
+      // cannot persist UVs/textures, so any existing entry — including one
+      // written before texture support shipped — would serve the model
+      // permanently untextured. Mirrors the cache-write skip below.
+      if (target.kind === 'primary' && cachePlan.shouldCache && !textureBitmaps) {
         setProgress({ phase: 'Checking cache', percent: 5 });
         const cacheResult = await getCached(cacheKey);
         if (cacheResult) {
@@ -820,7 +843,10 @@ export function useIfcLoader() {
       // A .ifcZIP source is fine on the server path: loadFromServer uploads the
       // original `file` object (still zipped) and the server unwraps the
       // container itself (apps/server extract_file, issue #1494) before parsing.
-      if (target.kind === 'primary' && format === 'ifc' && !mergeLayersAtLoad && USE_SERVER && SERVER_URL && SERVER_URL !== '') {
+      // EXCEPT texture-carrying containers (#1781): the server mesh wire format
+      // doesn't transport UVs/texture refs yet, so the server fast-path would
+      // silently render the model untextured — route those through local WASM.
+      if (target.kind === 'primary' && format === 'ifc' && !mergeLayersAtLoad && !textureBitmaps && USE_SERVER && SERVER_URL && SERVER_URL !== '') {
         // Pass buffer directly - server uses File object for parsing, buffer is only for size checks
         const serverSuccess = await loadFromServer(file, buffer, () => loadSessionRef.current !== currentSession);
         if (serverSuccess) {
@@ -1234,6 +1260,12 @@ export function useIfcLoader() {
               if (batchCount === 1) {
               }
 
+              // #1781: resolve external texture references against the decoded
+              // .ifcZIP sibling images BEFORE the meshes fan out to the
+              // renderer / geometryResult / spatial index — all share these
+              // same objects.
+              attachTextureBitmaps(event.meshes, textureBitmaps);
+
               // Collect meshes for BVH building (use loop to avoid stack overflow with large batches)
               for (let i = 0; i < event.meshes.length; i++) allMeshes.push(event.meshes[i]);
               // #924: fold instanced-only entity geometry hashes (no flat mesh
@@ -1426,8 +1458,18 @@ export function useIfcLoader() {
                 //    accessors. The hit is validated by the strengthened cache key,
                 //    so repeat opens have no main-thread hash stall.
                 // Files above 400MB (or with the mesh-only kill switch set) are not cached.
+                // Textured models are NOT cached (#1781): the binary cache
+                // format doesn't persist UVs/textures yet, so a cache hit would
+                // silently strip every texture on the second open. Re-processing
+                // each load keeps the render correct until the cache format
+                // learns texture sections.
+                const hasTexturedMeshes = allMeshes.some((m) => m.texture || m.textureRef);
+                if (hasTexturedMeshes) {
+                  console.log('[useIfc] Skipping cache write: model carries surface textures the cache format does not persist yet (#1781)');
+                }
                 if (
                   cachePlan.shouldCache &&
+                  !hasTexturedMeshes &&
                   allMeshes.length > 0 &&
                   finalCoordinateInfo
                 ) {
