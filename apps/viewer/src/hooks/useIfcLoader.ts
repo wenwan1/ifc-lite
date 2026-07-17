@@ -508,6 +508,7 @@ export function useIfcLoader() {
         setGeometryStreamingActive(false);
         const blob = file;
         const incCount = useViewerStore.getState().incrementPointCloudAssetCount;
+        const setClassCounts = useViewerStore.getState().setPointCloudClassCounts;
         const ingest = ingestPointCloud({
           format,
           blob,
@@ -516,6 +517,15 @@ export function useIfcLoader() {
           renderer,
           onProgress: setProgress,
           onAssetCountDelta: incCount,
+          // Session-guard the histogram writes: a superseded stream
+          // keeps publishing periodic counts until `done` settles, and
+          // an unguarded write would repopulate phantom classes after
+          // a newer load reset the store.
+          onClassCounts: (handleId, counts) => {
+            if (loadSessionRef.current === currentSession) {
+              setClassCounts(handleId, counts);
+            }
+          },
         });
         // Expose cancellation to the UI (StatusBar shows a Cancel
         // button while this is non-null). Cleared via the
@@ -547,6 +557,10 @@ export function useIfcLoader() {
               err,
             );
             renderer.removePointCloudAsset(ingest.rendererHandle);
+            // The stale asset never registers as a model, so the
+            // lifecycle hook can't drop its classification histogram —
+            // clear it here or the classes panel shows phantom counts.
+            setClassCounts(ingest.rendererHandle.id, null);
             clearOwnedCanceller();
             return;
           }
@@ -577,8 +591,11 @@ export function useIfcLoader() {
         if (loadSessionRef.current !== currentSession) {
           // A newer load already began. Drop our streamed asset and
           // skip every store/UI mutation so we don't overwrite the
-          // newer model's state.
+          // newer model's state. The completed stream already published
+          // its histogram under this handle and no model was registered
+          // for the lifecycle hook to clean up, so drop the counts too.
           renderer.removePointCloudAsset(ingest.rendererHandle);
+          setClassCounts(ingest.rendererHandle.id, null);
           return;
         }
         // Primary owns the active-model slots; a federated add must not touch
