@@ -1001,6 +1001,32 @@ ifc-lite mcp model.ifc --viewer          # also start the 3D viewer
 | `--viewer-port <N>` | Preferred viewer port (0 = auto) |
 | `--open` | Auto-open the viewer and open the URL in the browser |
 
+### `simplify` - Demesher
+
+Selectively simplify element meshes and write a lighter IFC (geometry is
+re-authored as `IfcTriangulatedFaceSet`; IFC2X3 input is upconverted to IFC4):
+
+```bash
+ifc-lite simplify model.ifc --out light.ifc --level 3
+ifc-lite simplify model.ifc --out light.ifc --level 5 --ids 12,44,107 --json
+```
+
+| Option | Description |
+|--------|-------------|
+| `--out <file>` | Output IFC path (required) |
+| `--level <1..5>` | Aggressiveness: 1-4 = cavity removal + decimation (target 50/25/10/3 % of triangles), 5 = bounding-box collapse (default 1) |
+| `--ids <a,b,...>` | Only simplify these express ids (default: all meshed elements) |
+| `--json` | Machine-readable report |
+
+What "lighter" means: the goal is TRIANGLE COUNT (viewer/render load), and
+on tessellation-heavy elements the reduction is large. It is not guaranteed
+per element: meshes below 32 triangles pass through levels 1-4 unchanged,
+and level 5 always emits a 12-triangle box, which can exceed a smaller
+input. File size usually drops on tessellation-heavy models (scans, CAD
+imports), but small parametric models can GROW in bytes, since verbose
+explicit tessellation replaces compact swept solids. Check the reported
+`trianglesBefore`/`trianglesAfter` and output size for your workload.
+
 ## Output Modes
 
 Every command supports structured output:
