@@ -172,11 +172,14 @@ describe('IfcMaterialConstituent fraction normalisation (weights sum to 1)', () 
         expect(w.get(311)).toBeCloseTo(2 / 3, 6);
     });
 
-    it('treats negative and zero fractions as unset (equal split, sum 1)', async () => {
+    it('treats a negative fraction as unset but PRESERVES an explicit zero', async () => {
+        // #460 has Fraction=-0.5 (malformed → unset → takes the remainder);
+        // #461 has an authored 0. (explicit "contributes nothing" → stays 0).
         const store = await parseFractions();
         const w = weights(store, 470);
-        expect(w.get(310)).toBeCloseTo(0.5, 6);
-        expect(w.get(311)).toBeCloseTo(0.5, 6);
+        expect(w.get(310)).toBeCloseTo(1, 6);
+        expect(w.get(311)).toBeCloseTo(0, 6);
+        expect((w.get(310) ?? 0) + (w.get(311) ?? 0)).toBeCloseTo(1, 9);
     });
 });
 

@@ -62,44 +62,100 @@ export interface MaterialConstituentInfo {
 }
 
 /**
+ * Resolve the OCCURRENCE-LEVEL material definition ids directly associated
+ * with an entity (no type fallback): every IfcRelAssociatesMaterial that
+ * targets it, deduped and ordered by the rel's express id — the same rule
+ * that decides the single-entry `onDemandMaterialMap` winner, so index 0
+ * always equals the map's entry. Falls back to the map when no relationship
+ * graph is available (minimal/test stores).
+ */
+function resolveOwnMaterialDefIds(store: IfcDataStore, entityId: number): number[] {
+    if (store.relationships) {
+        // Prefer getEdges (carries relationshipId for deterministic ordering);
+        // facade graphs (server data model, test mocks) may implement only
+        // getRelated, whose order is best-effort.
+        if (typeof store.relationships.inverse?.getEdges === 'function') {
+            const edges = store.relationships.inverse.getEdges(entityId, RelationshipType.AssociatesMaterial);
+            if (edges.length > 0) {
+                const sorted = [...edges].sort((a, b) => a.relationshipId - b.relationshipId);
+                const out: number[] = [];
+                for (const e of sorted) {
+                    if (!out.includes(e.target)) out.push(e.target);
+                }
+                return out;
+            }
+        } else {
+            const related = store.relationships.getRelated(entityId, RelationshipType.AssociatesMaterial, 'inverse');
+            if (related.length > 0) return [...new Set(related)];
+        }
+    }
+    // Map values are LISTS (all associations, file order) since #1773.
+    const mapped = store.onDemandMaterialMap?.get(entityId);
+    return mapped !== undefined ? [...mapped] : [];
+}
+
+/**
+ * Resolve ALL material definition ids for an entity: every occurrence-level
+ * IfcRelAssociatesMaterial (elements may legally carry more than one), or —
+ * when the occurrence has none — the associations of its type
+ * (IfcRelDefinesByType), matching {@link extractMaterialsOnDemand}'s
+ * occurrence-overrides-type precedence. Ordered by rel express id, so
+ * index 0 is the entity's deterministic "primary" material definition.
+ */
+export function resolveAllMaterialDefIds(store: IfcDataStore, entityId: number): number[] {
+    const own = resolveOwnMaterialDefIds(store, entityId);
+    if (own.length > 0) return own;
+
+    // Type fallback: first type with any association wins (mirrors the
+    // single-def lookup's `break`).
+    if (store.relationships) {
+        const typeIds = store.relationships.getRelated(entityId, RelationshipType.DefinesByType, 'inverse');
+        for (const typeId of typeIds) {
+            const typeDefs = resolveOwnMaterialDefIds(store, typeId);
+            if (typeDefs.length > 0) return typeDefs;
+        }
+    }
+    return [];
+}
+
+/**
+ * Extract EVERY material association for an entity ON-DEMAND, resolved to
+ * full material structures (layers, profiles, constituents, lists). Most
+ * entities carry one; exporters that attach e.g. a layer set *and* a plain
+ * fallback IfcMaterial yield several. Order matches
+ * {@link resolveAllMaterialDefIds}. Consumers that need a single value use
+ * {@link extractMaterialsOnDemand} (=== element 0 here).
+ */
+export function extractAllMaterialsOnDemand(
+    store: IfcDataStore,
+    entityId: number
+): MaterialInfo[] {
+    if (!store.source?.length) return [];
+    const defIds = resolveAllMaterialDefIds(store, entityId);
+    if (defIds.length === 0) return [];
+    const extractor = new EntityExtractor(store.source);
+    const out: MaterialInfo[] = [];
+    for (const defId of defIds) {
+        const info = resolveMaterial(store, extractor, defId, new Set());
+        if (info) out.push(info);
+    }
+    return out;
+}
+
+/**
  * Extract materials for a single entity ON-DEMAND.
  * Uses the onDemandMaterialMap built during parsing.
  * Falls back to relationship graph when on-demand map is not available (e.g., server-loaded models).
  * Also checks type-level material assignments via IfcRelDefinesByType.
  * Resolves the full material structure (layers, profiles, constituents, lists).
+ * Returns the entity's PRIMARY material (lowest-rel-express-id association);
+ * use {@link extractAllMaterialsOnDemand} when every association matters.
  */
 export function extractMaterialsOnDemand(
     store: IfcDataStore,
     entityId: number
 ): MaterialInfo | null {
-    let materialId: number | undefined;
-
-    // The map value is a list of associations (multiple IfcRelAssociatesMaterial
-    // on one element are valid in the wild); this single-material API resolves
-    // the primary (first) one. buildMaterialUsageIndex is where all associations
-    // are honoured.
-    if (store.onDemandMaterialMap) {
-        materialId = store.onDemandMaterialMap.get(entityId)?.[0];
-    } else if (store.relationships) {
-        // Fallback: use relationship graph (server-loaded models)
-        const related = store.relationships.getRelated(entityId, RelationshipType.AssociatesMaterial, 'inverse');
-        if (related.length > 0) materialId = related[0];
-    }
-
-    // Check type-level material if occurrence has none
-    if (materialId === undefined && store.relationships) {
-        const typeIds = store.relationships.getRelated(entityId, RelationshipType.DefinesByType, 'inverse');
-        for (const typeId of typeIds) {
-            if (store.onDemandMaterialMap) {
-                materialId = store.onDemandMaterialMap.get(typeId)?.[0];
-            } else {
-                const related = store.relationships.getRelated(typeId, RelationshipType.AssociatesMaterial, 'inverse');
-                if (related.length > 0) materialId = related[0];
-            }
-            if (materialId !== undefined) break;
-        }
-    }
-
+    const materialId = resolveAllMaterialDefIds(store, entityId)[0];
     if (materialId === undefined) return null;
     if (!store.source?.length) return null;
 
@@ -393,29 +449,7 @@ function readMaterialNameCategory(
  * element's type. Returns the definition express id, or undefined.
  */
 export function resolveMaterialDefId(store: IfcDataStore, entityId: number): number | undefined {
-    let materialId: number | undefined;
-
-    if (store.onDemandMaterialMap) {
-        materialId = store.onDemandMaterialMap.get(entityId)?.[0];
-    } else if (store.relationships) {
-        const related = store.relationships.getRelated(entityId, RelationshipType.AssociatesMaterial, 'inverse');
-        if (related.length > 0) materialId = related[0];
-    }
-
-    if (materialId === undefined && store.relationships) {
-        const typeIds = store.relationships.getRelated(entityId, RelationshipType.DefinesByType, 'inverse');
-        for (const typeId of typeIds) {
-            if (store.onDemandMaterialMap) {
-                materialId = store.onDemandMaterialMap.get(typeId)?.[0];
-            } else {
-                const related = store.relationships.getRelated(typeId, RelationshipType.AssociatesMaterial, 'inverse');
-                if (related.length > 0) materialId = related[0];
-            }
-            if (materialId !== undefined) break;
-        }
-    }
-
-    return materialId;
+    return resolveAllMaterialDefIds(store, entityId)[0];
 }
 
 const leavesCache = new WeakMap<IfcDataStore, Map<number, MaterialLeaf[]>>();
@@ -552,40 +586,43 @@ function resolveLeaves(
                 if (!constRef) continue;
                 const ca = extractor.extractEntity(constRef)?.attributes ?? [];
                 // IfcMaterialConstituent: [Name, Description, Material, Fraction, Category]
+                // An authored Fraction of 0 is preserved as 0 (an explicit
+                // "contributes nothing"), distinct from an ABSENT fraction.
                 constituents.push({
                     matId: typeof ca[2] === 'number' ? ca[2] : undefined,
-                    // Non-finite (NaN/Infinity), zero, and negative fractions are
-                    // all malformed for an IfcNormalisedRatioMeasure - treat them
-                    // as unset so they can't poison the weight arithmetic below.
-                    fraction: typeof ca[3] === 'number' && Number.isFinite(ca[3]) && ca[3] > 0 ? ca[3] : undefined,
+                    // Non-finite (NaN/Infinity) and negative fractions are
+                    // malformed for an IfcNormalisedRatioMeasure — treat them
+                    // as unset so they can't poison the weight arithmetic
+                    // below. An authored 0.0 is legal and PRESERVED: it is an
+                    // explicit "contributes nothing", distinct from absent.
+                    fraction: typeof ca[3] === 'number' && Number.isFinite(ca[3]) && ca[3] >= 0 ? ca[3] : undefined,
                 });
             }
-            // Constituent Fraction is optional per-constituent. When SOME
-            // constituents carry a fraction and others don't, the un-fractioned
-            // siblings must not collapse to weight 0 (the old `(f ?? 0)/total`
-            // did exactly that, dropping them from the totals). Instead the
-            // constituents WITHOUT an explicit fraction share whatever remains
-            // of the whole (1 - sum of explicit) evenly; when every constituent
-            // carries a fraction we normalise by their sum; with none we split
-            // equally. In every branch the weights sum to exactly 1, so the
-            // totals panel can never over-report an element's quantities.
+            // Constituent Fraction is optional per-constituent. Constituents
+            // WITHOUT an explicit fraction share whatever remains of the whole
+            // (1 - sum of explicit) evenly, so they must not collapse to
+            // weight 0 and vanish from the totals. When the explicit fractions
+            // already fill (or overflow) the whole, each implicit sibling gets
+            // an even 1/n share instead so it still registers. The set is then
+            // renormalised to sum to exactly 1 (e.g. {1.0, unset} would
+            // otherwise weigh 1.5x the element), so the totals panel can never
+            // over-report an element's quantities. Explicit zeros survive all
+            // branches: an all-explicit-zero set keeps every weight at 0
+            // rather than inventing equal shares.
             const explicitTotal = constituents.reduce((s, c) => s + (c.fraction ?? 0), 0);
             const implicitCount = constituents.reduce((n, c) => n + (c.fraction === undefined ? 1 : 0), 0);
-            if (explicitTotal <= 0) {
-                const n = constituents.length;
-                for (const c of constituents) addMaterialLeaf(c.matId, n > 0 ? 1 / n : 0);
-            } else if (implicitCount === 0) {
-                for (const c of constituents) addMaterialLeaf(c.matId, (c.fraction ?? 0) / explicitTotal);
-            } else {
-                // Mixed: implicit siblings share the remainder of the whole.
-                // When the explicit fractions already fill (or overflow) the
-                // whole, give each implicit sibling an even 1/n share instead
-                // so it still registers - then renormalise the set to sum to 1
-                // (e.g. {1.0, unset} would otherwise weigh 1.5x the element).
-                const remaining = 1 - explicitTotal;
-                const perImplicit = remaining > 0 ? remaining / implicitCount : 1 / constituents.length;
-                const total = explicitTotal + perImplicit * implicitCount;
-                for (const c of constituents) addMaterialLeaf(c.matId, (c.fraction ?? perImplicit) / total);
+            const remaining = 1 - explicitTotal;
+            const perImplicit = implicitCount > 0
+                ? (remaining > 0 ? remaining / implicitCount : 1 / constituents.length)
+                : 0;
+            const provisional = constituents.map((c) => c.fraction ?? perImplicit);
+            const totalWeight = provisional.reduce((s, w) => s + w, 0);
+            for (let i = 0; i < constituents.length; i++) {
+                // totalWeight can only be 0 when EVERY fraction is an authored
+                // 0.0 (absent fractions receive a positive share) — keep those
+                // explicit zeros instead of inventing equal weights.
+                const weight = totalWeight > 0 ? provisional[i] / totalWeight : 0;
+                addMaterialLeaf(constituents[i].matId, weight);
             }
             return [...merged.values()];
         }
@@ -623,10 +660,13 @@ const usageIndexCache = new WeakMap<IfcDataStore, Map<number, MaterialUsage>>();
 
 /**
  * Build (and memoise) the model-wide index of base material → using elements,
- * with per-element volume weights. Derived from the forward
- * `onDemandMaterialMap` (element → definition) that the parser already builds
- * when present, falling back to the relationship graph's AssociatesMaterial
- * edges (server-loaded models). Keyed by base IfcMaterial express id.
+ * with per-element volume weights. Element enumeration comes from the forward
+ * `onDemandMaterialMap` (element → definition list) that the parser already
+ * builds, falling back to the relationship graph's AssociatesMaterial edges
+ * (server-loaded models). Each element's definition list is preferentially
+ * resolved from the graph (rel-express-id order, deduped) so multiple
+ * IfcRelAssociatesMaterial per element all surface deterministically. Keyed
+ * by base IfcMaterial express id.
  */
 export function buildMaterialUsageIndex(store: IfcDataStore): Map<number, MaterialUsage> {
     const cached = usageIndexCache.get(store);
@@ -658,11 +698,31 @@ export function buildMaterialUsageIndex(store: IfcDataStore): Map<number, Materi
     // and collectMaterialLeaves has a source-less path (the definition becomes
     // one opaque full-weight leaf) precisely so this index works for them.
     if (forward && forward.size > 0) {
-        // Guards against a malformed model double-typing one occurrence
-        // (two IfcRelDefinesByType rels → duplicate forward edges), which
-        // would otherwise double-count it in the totals panel.
-        const seenPerMaterial = new Map<number, Set<number>>();
-        for (const [entityId, defIds] of forward) {
+        // One entries-row per (material, element): the totals panel counts
+        // rows, so an element must never appear twice under one material —
+        // duplicate DefinesByType edges (malformed double-typing) and repeated
+        // leaves must not add rows. But when SEVERAL of an element's
+        // associations resolve to the same base material (e.g. a layer set
+        // containing A plus a plain association to A) their weights ACCUMULATE
+        // on that single row instead of the later association being dropped
+        // (which would make the total depend on rel order).
+        const rowPerMaterial = new Map<number, Map<number, { entityId: number; weight: number }>>();
+        // A (malformed) multi-typed occurrence must aggregate only its WINNING
+        // type — the first material-bearing one in DefinesByType order, the
+        // same precedence resolveAllMaterialDefIds applies — or two type keys
+        // would each expand to it and double-count its quantities.
+        const winningTypeCache = new Map<number, number | undefined>();
+        const winningTypeFor = (occId: number): number | undefined => {
+            if (winningTypeCache.has(occId)) return winningTypeCache.get(occId);
+            let winner: number | undefined;
+            const typeIds = store.relationships!.getRelated(occId, RelationshipType.DefinesByType, 'inverse');
+            for (const typeId of typeIds) {
+                if (resolveOwnMaterialDefIds(store, typeId).length > 0) { winner = typeId; break; }
+            }
+            winningTypeCache.set(occId, winner);
+            return winner;
+        };
+        for (const [entityId, mappedDefIds] of forward) {
             // IfcRelAssociatesMaterial commonly targets the TYPE entity
             // (IfcDoorType etc.). The tab/totals need occurrences — a type
             // has no geometry, so a type-keyed entry is invisible in the
@@ -679,35 +739,47 @@ export function buildMaterialUsageIndex(store: IfcDataStore): Map<number, Materi
             if (ref && store.relationships && isIfcTypeLikeEntity(ref.type.toUpperCase())) {
                 targets = store.relationships
                     .getRelated(entityId, RelationshipType.DefinesByType, 'forward')
-                    .filter((occId) => !forward!.has(occId));
+                    .filter((occId) => !forward!.has(occId) && winningTypeFor(occId) === entityId);
             } else {
                 targets = [entityId];
             }
             if (targets.length === 0) continue;
+            // Duplicate forward edges (malformed double-typing) must not
+            // double a target's contribution within this map key.
+            const uniqueTargets = targets.length > 1 ? [...new Set(targets)] : targets;
 
-            // An element can carry more than one material association (valid in
-            // the wild); every definition contributes its leaves.
+            // Every association of this map key — an element carrying e.g. a
+            // layer set AND a fallback IfcMaterial must appear under both.
+            // Prefer the graph (rel-id-ordered, deduped); fall back to the
+            // map's own list when the store has no graph.
+            const graphDefIds = store.relationships ? resolveOwnMaterialDefIds(store, entityId) : [];
+            const defIds = graphDefIds.length > 0 ? graphDefIds : [...new Set(mappedDefIds)];
             for (const defId of defIds) {
                 const leaves = collectMaterialLeaves(store, defId);
                 for (const leaf of leaves) {
                     let entry = usage.get(leaf.id);
                     if (!entry) {
-                        const ref = getRef(store, leaf.id);
+                        const leafRef = getRef(store, leaf.id);
                         entry = {
                             id: leaf.id,
                             name: leaf.name || `Material #${leaf.id}`,
                             category: leaf.category,
-                            ifcClass: ref?.type || 'IfcMaterial',
+                            ifcClass: leafRef?.type || 'IfcMaterial',
                             entries: [],
                         };
                         usage.set(leaf.id, entry);
                     }
-                    let seen = seenPerMaterial.get(leaf.id);
-                    if (!seen) { seen = new Set(); seenPerMaterial.set(leaf.id, seen); }
-                    for (const target of targets) {
-                        if (seen.has(target)) continue;
-                        seen.add(target);
-                        entry.entries.push({ entityId: target, weight: leaf.weight });
+                    let rows = rowPerMaterial.get(leaf.id);
+                    if (!rows) { rows = new Map(); rowPerMaterial.set(leaf.id, rows); }
+                    for (const target of uniqueTargets) {
+                        const row = rows.get(target);
+                        if (row) {
+                            row.weight += leaf.weight;
+                        } else {
+                            const fresh = { entityId: target, weight: leaf.weight };
+                            rows.set(target, fresh);
+                            entry.entries.push(fresh);
+                        }
                     }
                 }
             }

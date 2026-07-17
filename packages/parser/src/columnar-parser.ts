@@ -646,6 +646,13 @@ export class ColumnarParser {
         const onDemandClassificationMap = new Map<number, number[]>();
         const onDemandMaterialMap = new Map<number, number[]>();
         const onDemandDocumentMap = new Map<number, number[]>();
+        // Determinism rule for elements with MULTIPLE IfcRelAssociatesMaterial:
+        // the map keeps EVERY association (list-valued), ordered by rel express
+        // id, so list[0] — the "primary" — is the RelatingMaterial of the
+        // LOWEST rel express id regardless of file order. The cache rebuild
+        // (viewer spatialHierarchy rebuildOnDemandMaps) applies the same rule
+        // via edge relationshipIds, so fresh-parse and cache-load agree.
+        const materialRelIds = new Map<number, number[]>();
 
         for (let i = 0; i < associationRelRefs.length; i++) {
             if ((i & 0x3FF) === 0) await yieldIfNeeded();
@@ -665,8 +672,17 @@ export class ColumnarParser {
                 } else if (typeUpper === 'IFCRELASSOCIATESMATERIAL') {
                     for (const objId of relatedObjects) {
                         let list = onDemandMaterialMap.get(objId);
-                        if (!list) { list = []; onDemandMaterialMap.set(objId, list); }
-                        list.push(relatingRef);
+                        let relIds = materialRelIds.get(objId);
+                        if (!list || !relIds) {
+                            list = []; onDemandMaterialMap.set(objId, list);
+                            relIds = []; materialRelIds.set(objId, relIds);
+                        }
+                        // Insert in rel-express-id order (lists are tiny) so
+                        // list[0] is the deterministic primary.
+                        let at = relIds.length;
+                        while (at > 0 && relIds[at - 1] > ref.expressId) at--;
+                        relIds.splice(at, 0, ref.expressId);
+                        list.splice(at, 0, relatingRef);
                         relationshipGraphBuilder.addEdge(relatingRef, objId, RelationshipType.AssociatesMaterial, ref.expressId);
                     }
                 } else if (typeUpper === 'IFCRELASSOCIATESDOCUMENT') {
@@ -1118,9 +1134,11 @@ export function pickLongName(entity: IfcEntity): string {
 export {
     extractClassificationsOnDemand,
     extractMaterialsOnDemand,
+    extractAllMaterialsOnDemand,
     extractMaterialPropertiesOnDemand,
     extractMaterialPropertiesForMaterialId,
     resolveMaterialDefId,
+    resolveAllMaterialDefIds,
     collectMaterialLeaves,
     buildMaterialUsageIndex,
     getMaterialDisplay,

@@ -88,4 +88,33 @@ describe('buildMaterialUsageIndex end-to-end type expansion (#1755)', () => {
         expect(info?.type).toBe('MaterialConstituentSet');
         expect(info?.constituents?.map((c) => c.materialName)).toEqual(['wood1', 'wood1']);
     });
+
+    it('a (malformed) double-typed occurrence aggregates only its WINNING type', async () => {
+        // Door #110 typed by BOTH door types (two IfcRelDefinesByType). The
+        // per-element lookup honours only the first material-bearing type, so
+        // the usage index must not expand the second type's materials onto it
+        // (which would double-count its quantities).
+        const DOUBLE_TYPED = IFC.replace(
+            `#210=IFCRELDEFINESBYTYPE('0RelType00000000000001',$,$,$,(#110),#200);`,
+            `#210=IFCRELDEFINESBYTYPE('0RelType00000000000001',$,$,$,(#110),#200);
+#212=IFCRELDEFINESBYTYPE('0RelType00000000000003',$,$,$,(#110),#201);`,
+        );
+        const { source, entityRefs } = scan(DOUBLE_TYPED);
+        const parser = new ColumnarParser();
+        const store = await parser.parseLite(source.buffer.slice(0) as ArrayBuffer, entityRefs, {});
+
+        const usage = buildMaterialUsageIndex(store);
+        const byName = new Map([...usage.values()].map((u) => [u.name, u]));
+
+        // #110's winning type is DETERMINISTIC: rel #210 (→ type #200/wood1)
+        // has the lower express id, so the per-element precedence picks wood1…
+        const winningInfo = extractMaterialsOnDemand(store, 110);
+        expect(winningInfo?.constituents?.[0]?.materialName).toBe('wood1');
+        // …and the index attributes #110 ONLY under wood1; under wood2 it
+        // must not appear at all.
+        expect(byName.get('wood1')!.entries.filter((e) => e.entityId === 110)).toHaveLength(1);
+        expect((byName.get('wood2')?.entries ?? []).filter((e) => e.entityId === 110)).toHaveLength(0);
+        // #120 (single-typed) is untouched by the gate.
+        expect(byName.get('wood2')!.entries.map((e) => e.entityId)).toContain(120);
+    });
 });
