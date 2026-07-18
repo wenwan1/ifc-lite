@@ -56,6 +56,16 @@ fn mesh_volume(mesh: &Mesh) -> f64 {
         / 6.0
 }
 
+/// Which void path these hosts take. The analytic prism cut (default) and the
+/// exact kernel (`IFC_LITE_PRISM_CUT=0`) tessellate the same cut with the same
+/// density class but different triangle counts, so the count pins below select
+/// per path — the feature-off build must still reproduce the old exact-kernel
+/// counts byte-for-byte. The bbox + oracle volume are the path-independent
+/// load-bearing invariants and are asserted unconditionally.
+fn prism_cut_enabled() -> bool {
+    std::env::var("IFC_LITE_PRISM_CUT").as_deref() != Ok("0")
+}
+
 fn bbox(positions: &[f32]) -> Option<((f32, f32, f32), (f32, f32, f32))> {
     if positions.is_empty() {
         return None;
@@ -144,7 +154,20 @@ fn wall_552611_2_openings_matches_ios() {
     // mesh-determinism manifest): the refinement's first-seen canonical ids
     // follow mesh order, so its bisection cascade re-baselined; bbox + oracle
     // volume above are the load-bearing invariants and are unchanged.
-    assert_eq!(mesh.indices.len() / 3, 188, "triangle count (kernel-native, was IOS 60)");
+    // Re-pinned 188 -> 204 for the analytic-prism void path (perf/beat-webifc):
+    // the conforming per-triangle CDT + the same consolidate_coplanar +
+    // refine_high_aspect_slivers post-passes tessellate the cut differently
+    // from the exact arrangement but with the same density class. The count is
+    // platform-stable for the same reason the exact pin was: FMA-free f64,
+    // deterministic CDT / i_overlay, BTreeMap bucket order. Load-bearing
+    // invariants remain the bbox + oracle volume above. Feature-off
+    // (IFC_LITE_PRISM_CUT=0) routes back through the exact kernel: 188.
+    let expect_tris = if prism_cut_enabled() { 204 } else { 188 };
+    assert_eq!(
+        mesh.indices.len() / 3,
+        expect_tris,
+        "triangle count (kernel-native, was IOS 60)"
+    );
 }
 
 #[test]
@@ -155,7 +178,11 @@ fn wall_552761_2_openings_matches_ios() {
     let vol = mesh_volume(&mesh);
     assert!((vol - 16.3967).abs() < 1e-3, "cut volume = {vol}, expected 16.3967");
     // Kernel re-baseline (was IOS 60): ~3x from `refine_high_aspect_slivers`.
-    assert_eq!(mesh.indices.len() / 3, 188);
+    // Re-pinned 188 -> 196 for the analytic-prism void path (see wall_552611's
+    // pin note); bbox + oracle volume are the load-bearing invariants.
+    // Feature-off (IFC_LITE_PRISM_CUT=0) routes back through the exact kernel: 188.
+    let expect_tris = if prism_cut_enabled() { 196 } else { 188 };
+    assert_eq!(mesh.indices.len() / 3, expect_tris);
     let _ = mx; // not used; presence of non-empty mesh is the assertion
 }
 
@@ -169,7 +196,11 @@ fn wall_555082_1_opening_matches_ios() {
     // Kernel re-baseline (IOS: v=20 t=36): ~3x from `refine_high_aspect_slivers`.
     // Re-pinned 114 -> 138 with the consolidate_coplanar BTreeMap bucket order
     // (see wall_552611 above); oracle volume is the load-bearing invariant.
-    assert_eq!(mesh.indices.len() / 3, 138);
+    // Re-pinned 138 -> 130 for the analytic-prism void path (see wall_552611's
+    // pin note) — the analytic cut consolidates BELOW the exact kernel here.
+    // Feature-off (IFC_LITE_PRISM_CUT=0) routes back through the exact kernel: 138.
+    let expect_tris = if prism_cut_enabled() { 130 } else { 138 };
+    assert_eq!(mesh.indices.len() / 3, expect_tris);
 }
 
 // ──────────────────────────── known-bad cases ──────────────────────────
